@@ -25,10 +25,12 @@ fn access_log_template() {
 
     // The access_log filter renders the configured text template
     // (`{method} {path} {status} {duration_ms}ms id={request_id}`) through the
-    // tracing subscriber. Like the other tracing-based access-log examples, the
-    // functional proof is that the template config loads and the request is
-    // proxied end-to-end; the `{request_id}` token is backed by the request_id
-    // filter in the chain, so a successful echo confirms the chain ran.
+    // tracing subscriber, which the in-process harness does not capture. This
+    // test therefore only asserts that the template config loads and does not
+    // disrupt proxying; the exact rendered output is covered by the unit tests
+    // (`template_testing`, `render_text_template_*`). The `{request_id}` token
+    // is backed by the request_id filter in the chain, so the echoed id below
+    // confirms that token's source ran.
     let raw = http_send(
         proxy.addr(),
         "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",

@@ -308,7 +308,7 @@ impl AccessLogFilter {
                 return Err("access_log: template must not be empty".into());
             }
             let parts = parse_template(&template, &request_headers, &response_headers)?;
-            if parts.is_empty() {
+            if !parts.iter().any(|part| matches!(part, TemplatePart::Field(_))) {
                 return Err("access_log: template must contain at least one {field} token".into());
             }
             EmitShape::Text(parts)

@@ -9,6 +9,8 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
+    fs::{File, OpenOptions},
+    io::BufWriter,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -83,6 +85,9 @@ pub struct AccessLogFilter {
 
     /// Whether response headers must be cached for emit.
     needs_response_headers: bool,
+
+    /// Where emitted records are written (tracing by default).
+    sink: RuntimeSink,
 }
 
 // -----------------------------------------------------------------------------
@@ -108,6 +113,33 @@ struct AccessLogConfig {
 
     /// Emit-time conditions (AND across keys).
     conditions: Option<AccessLogEmitConditions>,
+
+    /// Output sink; omitted means emit through the tracing subscriber.
+    #[serde(default)]
+    sink: Option<SinkConfig>,
+}
+
+/// Output sink configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SinkConfig {
+    /// Sink kind (`stdout` or `file`).
+    #[serde(rename = "type")]
+    kind: SinkKind,
+
+    /// File path; required for `file`, rejected for `stdout`.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Direct output sink kind.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SinkKind {
+    /// Write NDJSON lines to stdout, bypassing tracing.
+    Stdout,
+    /// Append NDJSON lines to a file (no rotation).
+    File,
 }
 
 /// Emit-time access log conditions.
@@ -209,6 +241,16 @@ struct EmitPlan {
     is_default: bool,
 }
 
+/// Runtime output sink resolved from [`SinkConfig`].
+enum RuntimeSink {
+    /// Emit via `tracing::info!`; the subscriber controls the format.
+    Tracing,
+    /// Write NDJSON lines directly to stdout.
+    Stdout,
+    /// Append NDJSON lines to a file (no rotation).
+    File(std::sync::Arc<std::sync::Mutex<BufWriter<File>>>),
+}
+
 /// Cached response metadata for emit on the body phase.
 #[derive(Clone, Debug)]
 struct AccessLogState {
@@ -284,12 +326,15 @@ impl AccessLogFilter {
             is_default,
         };
 
+        let sink = build_runtime_sink(cfg.sink)?;
+
         Ok(Self {
             sample_rate: cfg.sample_rate,
             counter: AtomicU64::default(),
             emit_plan,
             emit_conditions: cfg.conditions,
             needs_response_headers,
+            sink,
         })
     }
 
@@ -323,8 +368,9 @@ impl AccessLogFilter {
         // Skip all per-request record work when the access-log level is
         // disabled: the info! callsites below would discard the output, but
         // the duration sampling, condition evaluation, and record formatting
-        // run regardless unless gated here.
-        if !tracing::enabled!(tracing::Level::INFO) {
+        // run regardless unless gated here. Direct sinks (stdout/file) bypass
+        // tracing entirely, so the level gate must not suppress them.
+        if matches!(self.sink, RuntimeSink::Tracing) && !tracing::enabled!(tracing::Level::INFO) {
             return;
         }
         // Sample the duration once so the emit-time condition and the logged
@@ -390,6 +436,38 @@ impl AccessLogFilter {
         response_headers: Option<&http::HeaderMap>,
         duration_ms: u64,
     ) {
+        match &self.sink {
+            RuntimeSink::Tracing => self.emit_via_tracing(ctx, status, response_headers, duration_ms),
+            RuntimeSink::Stdout => {
+                let line = self.format_line_for_sink(ctx, status, response_headers, duration_ms);
+                #[expect(
+                    clippy::print_stdout,
+                    reason = "sink type stdout writes the line directly, bypassing tracing"
+                )]
+                {
+                    println!("{line}");
+                }
+            },
+            RuntimeSink::File(writer) => {
+                use std::io::Write as _;
+                let line = self.format_line_for_sink(ctx, status, response_headers, duration_ms);
+                if let Ok(mut w) = writer.lock() {
+                    drop(writeln!(w, "{line}"));
+                    drop(w.flush());
+                }
+            },
+        }
+    }
+
+    /// Emit through the tracing subscriber (the default sink), preserving the
+    /// flat default shape and the projected `record` shape.
+    fn emit_via_tracing(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        status: u16,
+        response_headers: Option<&http::HeaderMap>,
+        duration_ms: u64,
+    ) {
         if self.emit_plan.is_default {
             Self::emit_default(ctx, status, duration_ms);
             return;
@@ -397,6 +475,21 @@ impl AccessLogFilter {
 
         let record = self.emit_plan.build_record(ctx, status, response_headers, duration_ms);
         emit_projected_record(&record);
+    }
+
+    /// Format one NDJSON line for a direct sink (stdout or file).
+    ///
+    /// Both the default and projected plans serialize the same `build_record`
+    /// map, so a direct sink always emits a single JSON object per request.
+    fn format_line_for_sink(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        status: u16,
+        response_headers: Option<&http::HeaderMap>,
+        duration_ms: u64,
+    ) -> String {
+        let record = self.emit_plan.build_record(ctx, status, response_headers, duration_ms);
+        serde_json::to_string(&record).unwrap_or_default()
     }
 
     /// Default ten-field emit path.
@@ -632,7 +725,9 @@ impl HttpFilter for AccessLogFilter {
     /// is claimed, including when sampling or conditions drop it, so the
     /// caller does not re-emit it through the fixed-shape fallback.
     fn emit_deferred_record(&self, ctx: &HttpFilterContext<'_>, status: u16) -> bool {
-        if !tracing::enabled!(tracing::Level::INFO) {
+        // Direct sinks (stdout/file) bypass tracing, so the level gate must not
+        // suppress them; it stays a fast path only for the tracing sink.
+        if matches!(self.sink, RuntimeSink::Tracing) && !tracing::enabled!(tracing::Level::INFO) {
             return false;
         }
         let duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis());
@@ -912,6 +1007,46 @@ fn emit_projected_record(record: &BTreeMap<String, String>) {
 }
 
 // -----------------------------------------------------------------------------
+// Sink construction
+// -----------------------------------------------------------------------------
+
+/// Build a [`RuntimeSink`] from the deserialized `sink` config.
+///
+/// No `sink` emits through the tracing subscriber (the default). `stdout` and
+/// `file` bypass tracing and write NDJSON lines directly; `file` requires a
+/// `path` and `stdout` rejects one.
+fn build_runtime_sink(sink_cfg: Option<SinkConfig>) -> Result<RuntimeSink, FilterError> {
+    match sink_cfg {
+        None => Ok(RuntimeSink::Tracing),
+        Some(SinkConfig {
+            kind: SinkKind::Stdout,
+            path: None,
+        }) => Ok(RuntimeSink::Stdout),
+        Some(SinkConfig {
+            kind: SinkKind::Stdout,
+            path: Some(_),
+        }) => Err("access_log: sink type stdout does not accept a path".into()),
+        Some(SinkConfig {
+            kind: SinkKind::File,
+            path: Some(path),
+        }) => {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("access_log: cannot open log file {path:?}: {e}"))?;
+            Ok(RuntimeSink::File(std::sync::Arc::new(std::sync::Mutex::new(
+                BufWriter::new(file),
+            ))))
+        },
+        Some(SinkConfig {
+            kind: SinkKind::File,
+            path: None,
+        }) => Err("access_log: sink type file requires a path".into()),
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Numeric Conversion
 // -----------------------------------------------------------------------------
 
@@ -1179,6 +1314,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         for _ in 0..5 {
             assert!(filter.should_log(), "sample_rate=1.0 should log every request");
@@ -1196,6 +1332,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let mut logged = 0;
         for _ in 0..8 {
@@ -1218,6 +1355,7 @@ conditions:
                 },
                 emit_conditions: None,
                 needs_response_headers: false,
+                sink: RuntimeSink::Tracing,
             };
             let logged = (0..calls).filter(|_| filter.should_log()).count();
             assert_eq!(
@@ -1249,6 +1387,7 @@ conditions:
                 paths: None,
             }),
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let ctx = crate::test_utils::make_filter_context(&req);
@@ -1535,6 +1674,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1559,6 +1699,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let mut headers = http::HeaderMap::new();
         headers.insert("x-request-id", "req-123".parse().unwrap());
@@ -1599,6 +1740,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1627,6 +1769,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1689,6 +1832,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::DELETE, "/api/users/42");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1717,6 +1861,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1741,6 +1886,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1779,6 +1925,7 @@ conditions:
             },
             emit_conditions: None,
             needs_response_headers: false,
+            sink: RuntimeSink::Tracing,
         };
         assert_eq!(
             filter.response_body_access(),
@@ -2035,5 +2182,75 @@ conditions:
         let mut trailers = http::HeaderMap::new();
         let _prev = trailers.insert("grpc-status", http::HeaderValue::from_static(status));
         praxis_core::grpc::GrpcCompletion::from_headers(&trailers)
+    }
+
+    // -------------------------------------------------------------------------
+    // Sinks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn from_config_no_sink_defaults_to_tracing() {
+        let config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        let filter = test_filter(&config);
+        assert!(matches!(filter.sink, RuntimeSink::Tracing));
+    }
+
+    #[test]
+    fn from_config_parses_stdout_sink() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: stdout").unwrap();
+        let filter = test_filter(&yaml);
+        assert!(matches!(filter.sink, RuntimeSink::Stdout));
+    }
+
+    #[test]
+    fn from_config_rejects_sink_stdout_with_path() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: stdout\n  path: /tmp/x.log").unwrap();
+        let err = AccessLogFilter::from_config(&yaml)
+            .err()
+            .expect("stdout sink with a path should fail");
+        assert!(err.to_string().contains("does not accept a path"), "got: {err}");
+    }
+
+    #[test]
+    fn from_config_rejects_sink_file_without_path() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: file").unwrap();
+        let err = AccessLogFilter::from_config(&yaml)
+            .err()
+            .expect("file sink without a path should fail");
+        assert!(err.to_string().contains("requires a path"), "got: {err}");
+    }
+
+    #[test]
+    fn from_config_file_sink_opens_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("access.log");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap())).unwrap();
+        let filter = test_filter(&yaml);
+        assert!(
+            matches!(filter.sink, RuntimeSink::File(_)),
+            "file sink should be created"
+        );
+        assert!(log_path.exists(), "log file should be created on disk");
+    }
+
+    #[test]
+    fn file_sink_writes_ndjson_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("access.log");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap())).unwrap();
+        let filter = test_filter(&yaml);
+
+        let req = crate::test_utils::make_request(http::Method::GET, "/health");
+        let ctx = crate::test_utils::make_filter_context(&req);
+        filter.emit_access_log(&ctx, 200, None, 7);
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let line = contents.lines().next().expect("file sink should write one NDJSON line");
+        let record: BTreeMap<String, String> = serde_json::from_str(line).unwrap();
+        assert_eq!(record.get("method").map(String::as_str), Some("GET"));
+        assert_eq!(record.get("path").map(String::as_str), Some("/health"));
+        assert_eq!(record.get("status").map(String::as_str), Some("200"));
     }
 }

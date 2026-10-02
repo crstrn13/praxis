@@ -5,10 +5,8 @@
 
 use std::{collections::HashMap, thread::sleep, time::Duration};
 
-use praxis_core::config::Config;
 use praxis_test_utils::{
-    allow_loopback_endpoints, example_config_path, free_port, http_send, parse_status, patch_yaml,
-    start_backend_with_shutdown, start_proxy,
+    free_port, http_send, load_example_config, parse_status, start_backend_with_shutdown, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -39,19 +37,29 @@ fn access_log_file_sink() {
     let backend_port = backend_port_guard.port();
     let proxy_port = free_port();
 
-    // Point the file sink at a unique temp path so the test is isolated and
-    // self-cleaning; the example ships a fixed `/tmp` path for operators.
+    // Load the real example through the shared harness, then point the file
+    // sink at a unique temp path so the test is isolated and self-cleaning; the
+    // example ships a fixed `/tmp` path for operators.
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("access.log");
-    let yaml =
-        std::fs::read_to_string(example_config_path("observability/access-log-file-sink.yaml")).expect("read example");
-    let yaml = yaml.replace("/tmp/praxis-access.log", log_path.to_str().expect("utf8 path"));
-    let patched = allow_loopback_endpoints(&patch_yaml(
-        &yaml,
+    let mut config = load_example_config(
+        "observability/access-log-file-sink.yaml",
         proxy_port,
-        &HashMap::from([("127.0.0.1:3000", backend_port)]),
-    ));
-    let config = Config::from_yaml(&patched).expect("parse patched config");
+        HashMap::from([("127.0.0.1:3000", backend_port)]),
+    );
+    let sink_path = log_path.to_str().expect("utf8 path");
+    let mut patched = false;
+    for chain in &mut config.filter_chains {
+        for entry in &mut chain.filters {
+            if entry.filter_type == "access_log"
+                && let Some(sink) = entry.config.get_mut("sink").and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                sink.insert("path".into(), sink_path.into());
+                patched = true;
+            }
+        }
+    }
+    assert!(patched, "example should configure an access_log file sink to override");
     let proxy = start_proxy(&config);
 
     let raw = http_send(

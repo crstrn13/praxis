@@ -2,7 +2,10 @@
 #
 # Writes NDJSON access log records directly to a file, bypassing the
 # tracing subscriber. The file is opened in append+create mode at
-# startup; use logrotate or a similar tool for rotation.
+# startup and the handle is retained, so rename-based rotation keeps
+# writing to the rotated file; restart the proxy to reopen. logrotate's
+# copytruncate works without a reopen but can lose records written
+# between the copy and the truncate.
 #
 # Usage:
 #   cargo run -p praxis-proxy -- -c examples/configs/observability/access-log-file-sink.yaml

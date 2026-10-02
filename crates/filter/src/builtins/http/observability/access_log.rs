@@ -8,10 +8,15 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
-    fs::{File, OpenOptions},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::OpenOptions,
     io::BufWriter,
-    sync::atomic::{AtomicU64, Ordering},
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
 };
 
 use async_trait::async_trait;
@@ -51,6 +56,9 @@ use crate::{
 ///   min_duration_ms: 1000
 ///   status_classes: [4xx, 5xx]  # OR within list
 ///   paths: ["/api"]             # OR within list; segment-boundary prefixes
+/// sink:                         # optional; default emits via the subscriber
+///   type: file                  # `stdout` or `file`
+///   path: /var/log/praxis/access.log  # required for `file`, rejected for `stdout`
 /// ```
 ///
 /// When `fields` is omitted, the default ten fields are emitted:
@@ -114,15 +122,35 @@ struct AccessLogConfig {
     /// Emit-time conditions (AND across keys).
     conditions: Option<AccessLogEmitConditions>,
 
-    /// Output sink; omitted means emit through the tracing subscriber.
+    /// Output sink: `{type: stdout}` or `{type: file, path: ...}`. Omitted means
+    /// emit through the tracing subscriber.
     #[serde(default)]
     sink: Option<SinkConfig>,
 }
 
 /// Output sink configuration.
+///
+/// Deserialized via [`RawSinkConfig`] so serde rejects unknown fields and the
+/// invalid `(type, path)` pairings during deserialization, leaving a resolved
+/// enum whose variants carry exactly the fields valid for each sink.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawSinkConfig")]
+enum SinkConfig {
+    /// Write NDJSON lines to stdout, bypassing tracing.
+    Stdout,
+    /// Append NDJSON lines to a file (no rotation).
+    File {
+        /// Destination path, opened in append+create mode.
+        path: String,
+    },
+}
+
+/// Sink config exactly as written in YAML, before validation into
+/// [`SinkConfig`]. Keeps `#[serde(deny_unknown_fields)]` so a stray key is still
+/// rejected (an internally tagged enum would silently ignore it).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SinkConfig {
+struct RawSinkConfig {
     /// Sink kind (`stdout` or `file`).
     #[serde(rename = "type")]
     kind: SinkKind,
@@ -132,14 +160,27 @@ struct SinkConfig {
     path: Option<String>,
 }
 
-/// Direct output sink kind.
+/// Direct output sink kind discriminant.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SinkKind {
-    /// Write NDJSON lines to stdout, bypassing tracing.
+    /// Write NDJSON lines to stdout.
     Stdout,
-    /// Append NDJSON lines to a file (no rotation).
+    /// Append NDJSON lines to a file.
     File,
+}
+
+impl TryFrom<RawSinkConfig> for SinkConfig {
+    type Error = String;
+
+    fn try_from(raw: RawSinkConfig) -> Result<Self, Self::Error> {
+        match (raw.kind, raw.path) {
+            (SinkKind::Stdout, None) => Ok(Self::Stdout),
+            (SinkKind::Stdout, Some(_)) => Err("access_log: sink type stdout does not accept a path".to_owned()),
+            (SinkKind::File, Some(path)) => Ok(Self::File { path }),
+            (SinkKind::File, None) => Err("access_log: sink type file requires a path".to_owned()),
+        }
+    }
 }
 
 /// Emit-time access log conditions.
@@ -245,10 +286,164 @@ struct EmitPlan {
 enum RuntimeSink {
     /// Emit via `tracing::info!`; the subscriber controls the format.
     Tracing,
-    /// Write NDJSON lines directly to stdout.
-    Stdout,
-    /// Append NDJSON lines to a file (no rotation).
-    File(std::sync::Arc<std::sync::Mutex<BufWriter<File>>>),
+    /// Write NDJSON lines to a background writer (stdout or a file).
+    Direct(DirectSink),
+}
+
+/// Bounded queue capacity for a direct sink's background writer. Records are
+/// dropped (not blocked on) once this many are queued, so a slow or stalled
+/// sink can never block a request executor thread.
+const SINK_QUEUE_CAPACITY: usize = 8_192;
+
+/// Handle to a background NDJSON writer shared by every filter instance that
+/// targets the same destination.
+///
+/// Emitting hands an owned line to a bounded channel and returns immediately;
+/// the blocking write and flush happen on a dedicated writer thread. A full
+/// channel drops the line (counted, with a rate-limited warning) rather than
+/// stalling the request path.
+#[derive(Clone)]
+struct DirectSink {
+    /// Sender into the writer thread's bounded queue.
+    tx: SyncSender<String>,
+    /// Destination label for diagnostics (`"stdout"` or the file path).
+    dest: Arc<str>,
+    /// Count of lines dropped because the queue was full.
+    dropped: Arc<AtomicU64>,
+    /// Unix-seconds timestamp of the last drop warning, for rate limiting.
+    last_drop_warn: Arc<AtomicU64>,
+}
+
+impl DirectSink {
+    /// Build a handle around a channel sender.
+    fn new(tx: SyncSender<String>, dest: Arc<str>) -> Self {
+        Self {
+            tx,
+            dest,
+            dropped: Arc::new(AtomicU64::new(0)),
+            last_drop_warn: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Queue one line for the background writer, dropping it if the queue is
+    /// full so the caller never blocks.
+    fn record(&self, line: String) {
+        if self.tx.try_send(line).is_err() {
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = unix_secs();
+            let prev = self.last_drop_warn.load(Ordering::Relaxed);
+            if now > prev
+                && self
+                    .last_drop_warn
+                    .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                tracing::warn!(sink = %self.dest, dropped = total, "access_log sink queue full; dropping records");
+            }
+        }
+    }
+}
+
+/// Throttles write-failure warnings on a writer thread to at most one per
+/// second so a persistently failing sink cannot flood the logs.
+#[derive(Default)]
+struct WriteWarnThrottle {
+    /// Unix-seconds timestamp of the last emitted warning.
+    last_secs: u64,
+}
+
+impl WriteWarnThrottle {
+    /// Warn about a write/flush failure unless one was already logged this
+    /// second.
+    fn warn(&mut self, dest: &str, err: &std::io::Error) {
+        let now = unix_secs();
+        if now != self.last_secs {
+            self.last_secs = now;
+            tracing::warn!(sink = %dest, error = %err, "access_log sink write failed");
+        }
+    }
+}
+
+/// Seconds since the Unix epoch, saturating to 0 before 1970.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Drain the queue onto `writer`, batching available lines before each flush
+/// and reporting (rate-limited) failures. Returns when every sender is dropped.
+fn run_sink_writer<W: std::io::Write>(mut writer: W, rx: &Receiver<String>, dest: &str) {
+    let mut throttle = WriteWarnThrottle::default();
+    while let Ok(line) = rx.recv() {
+        let mut result = writeln!(writer, "{line}");
+        // Write any further queued lines before paying for a single flush.
+        while result.is_ok() {
+            match rx.try_recv() {
+                Ok(next) => result = writeln!(writer, "{next}"),
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = result.and_then(|()| writer.flush()) {
+            throttle.warn(dest, &e);
+        }
+    }
+    drop(writer.flush());
+}
+
+/// Spawn the dedicated writer thread for a destination.
+///
+/// On the rare spawn failure the sink is left without a writer; its queue then
+/// fills and records drop with the usual warning rather than bringing the proxy
+/// down.
+fn spawn_sink_writer<W: std::io::Write + Send + 'static>(writer: W, rx: Receiver<String>, dest: Arc<str>) {
+    let result = std::thread::Builder::new()
+        .name("access-log-sink".to_owned())
+        .spawn(move || run_sink_writer(writer, &rx, &dest));
+    if let Err(e) = result {
+        tracing::error!(error = %e, "failed to spawn access_log sink writer thread");
+    }
+}
+
+/// The process-wide stdout sink, created on first use.
+fn stdout_sink() -> DirectSink {
+    static STDOUT: OnceLock<DirectSink> = OnceLock::new();
+    STDOUT
+        .get_or_init(|| {
+            let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
+            let dest: Arc<str> = Arc::from("stdout");
+            spawn_sink_writer(std::io::stdout(), rx, Arc::clone(&dest));
+            DirectSink::new(tx, dest)
+        })
+        .clone()
+}
+
+/// A file sink for `path`, shared across filter instances that name the same
+/// destination so a single writer and queue serialize all writes and NDJSON
+/// records never interleave.
+fn file_sink(path: &str) -> Result<DirectSink, FilterError> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, DirectSink>>> = OnceLock::new();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("access_log: cannot open log file {path:?}: {e}"))?;
+    // Canonicalize so `./a.log` and `a.log` resolve to one writer; fall back to
+    // the raw path if the resolve fails (it cannot, having just opened it).
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let registry = FILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sink) = guard.get(&key) {
+        // Another instance already owns this destination; drop our extra handle.
+        return Ok(sink.clone());
+    }
+    let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
+    let dest: Arc<str> = Arc::from(path);
+    spawn_sink_writer(BufWriter::new(file), rx, Arc::clone(&dest));
+    let sink = DirectSink::new(tx, dest);
+    guard.insert(key, sink.clone());
+    drop(guard);
+    Ok(sink)
 }
 
 /// Cached response metadata for emit on the body phase.
@@ -438,23 +633,9 @@ impl AccessLogFilter {
     ) {
         match &self.sink {
             RuntimeSink::Tracing => self.emit_via_tracing(ctx, status, response_headers, duration_ms),
-            RuntimeSink::Stdout => {
+            RuntimeSink::Direct(sink) => {
                 let line = self.format_line_for_sink(ctx, status, response_headers, duration_ms);
-                #[expect(
-                    clippy::print_stdout,
-                    reason = "sink type stdout writes the line directly, bypassing tracing"
-                )]
-                {
-                    println!("{line}");
-                }
-            },
-            RuntimeSink::File(writer) => {
-                use std::io::Write as _;
-                let line = self.format_line_for_sink(ctx, status, response_headers, duration_ms);
-                if let Ok(mut w) = writer.lock() {
-                    drop(writeln!(w, "{line}"));
-                    drop(w.flush());
-                }
+                sink.record(line);
             },
         }
     }
@@ -1018,31 +1199,8 @@ fn emit_projected_record(record: &BTreeMap<String, String>) {
 fn build_runtime_sink(sink_cfg: Option<SinkConfig>) -> Result<RuntimeSink, FilterError> {
     match sink_cfg {
         None => Ok(RuntimeSink::Tracing),
-        Some(SinkConfig {
-            kind: SinkKind::Stdout,
-            path: None,
-        }) => Ok(RuntimeSink::Stdout),
-        Some(SinkConfig {
-            kind: SinkKind::Stdout,
-            path: Some(_),
-        }) => Err("access_log: sink type stdout does not accept a path".into()),
-        Some(SinkConfig {
-            kind: SinkKind::File,
-            path: Some(path),
-        }) => {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| format!("access_log: cannot open log file {path:?}: {e}"))?;
-            Ok(RuntimeSink::File(std::sync::Arc::new(std::sync::Mutex::new(
-                BufWriter::new(file),
-            ))))
-        },
-        Some(SinkConfig {
-            kind: SinkKind::File,
-            path: None,
-        }) => Err("access_log: sink type file requires a path".into()),
+        Some(SinkConfig::Stdout) => Ok(RuntimeSink::Direct(stdout_sink())),
+        Some(SinkConfig::File { path }) => Ok(RuntimeSink::Direct(file_sink(&path)?)),
     }
 }
 
@@ -1710,11 +1868,11 @@ conditions:
         };
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.client_addr = Some("10.0.0.1".parse().unwrap());
-        ctx.cluster = Some(std::sync::Arc::from("backend"));
+        ctx.cluster = Some(Arc::from("backend"));
         ctx.upstream = Some(Upstream {
-            address: std::sync::Arc::from("10.0.0.2:8080"),
+            address: Arc::from("10.0.0.2:8080"),
             authority: None,
-            connection: std::sync::Arc::new(ConnectionOptions::default()),
+            connection: Arc::new(ConnectionOptions::default()),
             tls: None,
         });
         let mut resp = crate::context::Response {
@@ -1959,8 +2117,6 @@ conditions:
 
     /// Capture `tracing` output emitted synchronously by `f` on this thread.
     fn capture_logs<F: FnOnce()>(f: F) -> String {
-        use std::sync::{Arc, Mutex};
-
         #[derive(Clone)]
         struct Buffer(Arc<Mutex<Vec<u8>>>);
 
@@ -2195,11 +2351,29 @@ conditions:
         assert!(matches!(filter.sink, RuntimeSink::Tracing));
     }
 
+    /// Read a file, retrying briefly so a background writer thread has time to
+    /// flush before the assertion runs.
+    #[expect(clippy::disallowed_methods, reason = "sync sink tests poll with thread::sleep")]
+    fn read_file_with_retry(path: &std::path::Path) -> String {
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && !contents.is_empty()
+            {
+                return contents;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
     #[test]
     fn from_config_parses_stdout_sink() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: stdout").unwrap();
         let filter = test_filter(&yaml);
-        assert!(matches!(filter.sink, RuntimeSink::Stdout));
+        let RuntimeSink::Direct(sink) = &filter.sink else {
+            panic!("stdout sink should resolve to a direct sink");
+        };
+        assert_eq!(&*sink.dest, "stdout");
     }
 
     #[test]
@@ -2228,7 +2402,7 @@ conditions:
             serde_yaml::from_str(&format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap())).unwrap();
         let filter = test_filter(&yaml);
         assert!(
-            matches!(filter.sink, RuntimeSink::File(_)),
+            matches!(filter.sink, RuntimeSink::Direct(_)),
             "file sink should be created"
         );
         assert!(log_path.exists(), "log file should be created on disk");
@@ -2246,11 +2420,63 @@ conditions:
         let ctx = crate::test_utils::make_filter_context(&req);
         filter.emit_access_log(&ctx, 200, None, 7);
 
-        let contents = std::fs::read_to_string(&log_path).unwrap();
+        // The write happens on the background writer thread, so poll briefly
+        // for the line to land before asserting.
+        let contents = read_file_with_retry(&log_path);
         let line = contents.lines().next().expect("file sink should write one NDJSON line");
         let record: BTreeMap<String, String> = serde_json::from_str(line).unwrap();
         assert_eq!(record.get("method").map(String::as_str), Some("GET"));
         assert_eq!(record.get("path").map(String::as_str), Some("/health"));
         assert_eq!(record.get("status").map(String::as_str), Some("200"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::disallowed_methods,
+        reason = "concurrency test spawns threads and polls with thread::sleep"
+    )]
+    fn file_sink_shares_one_writer_per_path() {
+        // Two filters pointed at the same path must share a single writer so
+        // their NDJSON records never interleave, even under concurrency.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("shared.log");
+        let cfg = format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap());
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&cfg).unwrap();
+        let filter_a = Arc::new(test_filter(&yaml));
+        let filter_b = Arc::new(test_filter(&yaml));
+
+        let per_thread = 200;
+        let handles: Vec<_> = [(filter_a, "/a"), (filter_b, "/b")]
+            .into_iter()
+            .map(|(filter, path)| {
+                std::thread::spawn(move || {
+                    let req = crate::test_utils::make_request(http::Method::GET, path);
+                    for _ in 0..per_thread {
+                        let ctx = crate::test_utils::make_filter_context(&req);
+                        filter.emit_access_log(&ctx, 200, None, 1);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Every written line must be a complete, parseable NDJSON record.
+        let mut lines = 0;
+        for _ in 0..100 {
+            let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+            lines = contents.lines().count();
+            for line in contents.lines() {
+                serde_json::from_str::<BTreeMap<String, String>>(line)
+                    .unwrap_or_else(|e| panic!("line should be valid NDJSON ({e}): {line}"));
+            }
+            if lines == per_thread * 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(lines, per_thread * 2, "all records from both filters should be written");
     }
 }

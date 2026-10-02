@@ -73,6 +73,8 @@ mod pipeline;
 #[cfg(feature = "policy-engine")]
 mod policy;
 #[cfg(feature = "policy-engine")]
+mod policy_api_key;
+#[cfg(feature = "policy-engine")]
 mod policy_assertions;
 #[cfg(feature = "policy-engine")]
 mod policy_http;
@@ -85,6 +87,7 @@ mod process_logging;
 mod protocol_examples;
 mod protocols;
 mod random;
+mod rate_limit_shadow;
 mod redirect;
 mod retry_policy;
 mod ring_hash;

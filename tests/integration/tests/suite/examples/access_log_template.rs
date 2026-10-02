@@ -28,7 +28,7 @@ fn access_log_template() {
     // tracing subscriber, which the in-process harness does not capture. This
     // test therefore only asserts that the template config loads and does not
     // disrupt proxying; the exact rendered output is covered by the unit tests
-    // (`template_testing`, `render_text_template_*`). The `{request_id}` token
+    // (`render_text_template_*`). The `{request_id}` token
     // is backed by the request_id filter in the chain, so the echoed id below
     // confirms that token's source ran.
     let raw = http_send(

@@ -560,8 +560,9 @@ fn parse_template(
 /// Render template parts into a log line string.
 ///
 /// Each [`TemplatePart::Literal`] is emitted verbatim. Each
-/// [`TemplatePart::Field`] is resolved to its value for this request/response;
-/// unknown or missing values fall back to `"-"`.
+/// [`TemplatePart::Field`] is resolved to its value for this request/response
+/// and sanitized with [`sanitize_for_log`] so body-derived values cannot forge
+/// log lines; unknown or missing values fall back to `"-"`.
 fn render_text_template(
     parts: &[TemplatePart],
     ctx: &HttpFilterContext<'_>,
@@ -579,7 +580,8 @@ fn render_text_template(
             TemplatePart::Field(field) => {
                 let map =
                     build_record_from_fields(std::slice::from_ref(field), ctx, status, response_headers, duration_ms);
-                result.push_str(&map.into_values().next().unwrap_or_else(|| "-".to_owned()));
+                let value = map.into_values().next().unwrap_or_else(|| "-".to_owned());
+                result.push_str(&sanitize_for_log(&value));
             },
         }
     }
@@ -1485,6 +1487,16 @@ conditions:
         assert_eq!(line, "-", "missing cluster should render as dash");
     }
 
+    #[test]
+    fn render_text_template_sanitizes_field_values() {
+        let parts = vec![TemplatePart::Field(FieldToken::Metadata("llm.model".to_owned()))];
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("llm.model", "gpt\ninjected 200");
+        let line = render_text_template(&parts, &ctx, 200, None, 0);
+        assert!(!line.contains('\n'), "newlines in field values must not forge log lines");
+    }
+
     // -------------------------------------------------------------------------
     // Sampling and emit conditions (unchanged)
     // -------------------------------------------------------------------------
@@ -2278,22 +2290,25 @@ conditions:
     }
 
     #[test]
-    fn template_testing() {
-        let template = "{method} id={request_id} agent={response_header.user_agent}";
+    fn render_text_template_substitutes_request_id_and_response_header() {
+        let template = "{method} id={request_id} agent={response_header.user-agent}";
         let mut request_headers = HashSet::new();
         let mut response_headers = HashSet::new();
 
-        request_headers.insert(String::from("user_agent"));
-        response_headers.insert(String::from("user_agent"));
+        request_headers.insert(String::from("user-agent"));
+        response_headers.insert(String::from("user-agent"));
         let parts = parse_template(template, &request_headers, &response_headers).unwrap();
-        assert_eq!(parts.len(), 5);
+        assert_eq!(parts.len(), 5, "method, literal, request_id, literal, response_header");
 
         let mut req = crate::test_utils::make_request(http::Method::GET, "/");
         req.headers.insert("x-request-id", "abdc".parse().unwrap());
         let ctx = crate::test_utils::make_filter_context(&req);
         let mut response_headers_map = http::HeaderMap::new();
-        response_headers_map.insert("user_agent", "my-agent".parse().unwrap());
+        response_headers_map.insert("user-agent", "my-agent".parse().unwrap());
         let line = render_text_template(&parts, &ctx, 200, Some(&response_headers_map), 5);
-        assert_eq!(line, "GET id=abdc agent=my-agent");
+        assert_eq!(
+            line, "GET id=abdc agent=my-agent",
+            "template should interpolate method, request id, and response header"
+        );
     }
 }

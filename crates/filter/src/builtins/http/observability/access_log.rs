@@ -1494,7 +1494,10 @@ conditions:
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.set_metadata("llm.model", "gpt\ninjected 200");
         let line = render_text_template(&parts, &ctx, 200, None, 0);
-        assert!(!line.contains('\n'), "newlines in field values must not forge log lines");
+        assert!(
+            !line.contains('\n'),
+            "newlines in field values must not forge log lines"
+        );
     }
 
     // -------------------------------------------------------------------------

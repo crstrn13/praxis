@@ -1340,8 +1340,9 @@ fn parse_field_tokens(
 
 /// Field tokens for the default flat shape.
 ///
-/// The tracing path logs the default shape through the flat [`emit_default`]
-/// macro, so it never needs these tokens; a direct sink serializes a JSON
+/// The tracing path logs the default shape through the flat
+/// [`AccessLogFilter::emit_default`] method, so it never needs these tokens; a
+/// direct sink serializes a JSON
 /// object instead and builds it from this list. Every name is a known-valid
 /// scalar token, so parse failures are impossible and dropped.
 fn default_field_tokens() -> Vec<FieldToken> {

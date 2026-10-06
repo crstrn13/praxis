@@ -49,16 +49,27 @@ use crate::{
 ///   min_duration_ms: 1000
 ///   status_classes: [4xx, 5xx]  # OR within list
 ///   paths: ["/api"]             # OR within list; segment-boundary prefixes
-/// template: "{method} {path} [{status}] {duration_ms}ms"  # optional; when set, output is a text line
+/// ```
+///
+/// # Template YAML
+///
+/// ```yaml
+/// filter: access_log
+/// # Mutually exclusive with `fields`; quote client-controlled tokens.
+/// template: '{method} {path} [{status}] {duration_ms}ms ua="{request_header.user-agent}"'
+/// request_headers: [user-agent]
 /// ```
 ///
 /// When `fields` is omitted, the default ten fields are emitted:
 /// `method`, `path`, `client_ip`, `status`, `duration_ms`, `cluster`,
 /// `upstream`, `request_id`, `request_body_bytes`, `response_body_bytes`.
 ///
-/// When `template` is set, output is a text line rendered from the `{field}`
-/// placeholders. Otherwise output is JSON (the default). Either shape goes
-/// through the tracing subscriber.
+/// When `template` is set, the rendered string is logged as the `line` field of
+/// the `access` event; `PRAXIS_LOG_FORMAT` still decides whether the subscriber
+/// writes text or JSON. Otherwise the record is a field projection. Each resolved
+/// value is control-character sanitized and has `"` and `\` escaped, so quote
+/// client-controlled tokens (`{request_header.*}`, `{request_id}`) in the
+/// template to keep fields unambiguous.
 ///
 /// Template tokens follow the same names as field tokens: `{method}`,
 /// `{path}`, `{client_ip}`, `{status}`, `{duration_ms}`, `{cluster}`,
@@ -121,8 +132,9 @@ struct AccessLogConfig {
     /// Emit-time conditions (AND across keys).
     conditions: Option<AccessLogEmitConditions>,
 
-    /// Text template string with `{field}` placeholders. When present, output is
-    /// a rendered text line instead of JSON. Mutually exclusive with `fields`.
+    /// Text template with `{field}` placeholders. The rendered string is logged
+    /// as the `line` field of the `access` event, and `PRAXIS_LOG_FORMAT` still
+    /// decides text or JSON output. Mutually exclusive with `fields`.
     template: Option<String>,
 }
 
@@ -232,7 +244,7 @@ enum EmitShape {
     DefaultFlat,
     /// User-selected field projection emitted as a `record` JSON field.
     JsonRecord(Vec<FieldToken>),
-    /// Text line built from a parsed template, emitted as the record message.
+    /// Text line built from a parsed template, logged as the event's `line` field.
     Text(Vec<TemplatePart>),
 }
 
@@ -561,8 +573,8 @@ fn parse_template(
 ///
 /// Each [`TemplatePart::Literal`] is emitted verbatim. Each
 /// [`TemplatePart::Field`] is resolved to its value for this request/response
-/// and sanitized with [`sanitize_for_log`] so body-derived values cannot forge
-/// log lines; unknown or missing values fall back to `"-"`.
+/// and passed through [`push_escaped_field`]; unknown or missing values fall
+/// back to `"-"`.
 fn render_text_template(
     parts: &[TemplatePart],
     ctx: &HttpFilterContext<'_>,
@@ -581,11 +593,28 @@ fn render_text_template(
                 let map =
                     build_record_from_fields(std::slice::from_ref(field), ctx, status, response_headers, duration_ms);
                 let value = map.into_values().next().unwrap_or_else(|| "-".to_owned());
-                result.push_str(&sanitize_for_log(&value));
+                push_escaped_field(&mut result, &value);
             },
         }
     }
     result
+}
+
+/// Append a resolved field value to a rendered template line, defending against
+/// log injection.
+///
+/// The value is first control-character sanitized with [`sanitize_for_log`]
+/// (dropping newlines so it cannot forge a new log line), then `"` and `\` are
+/// backslash-escaped nginx-style so a client-controlled value cannot break out
+/// of a quoted template field (e.g. forging a status by closing an earlier
+/// quote).
+fn push_escaped_field(result: &mut String, value: &str) {
+    for ch in sanitize_for_log(value).chars() {
+        if matches!(ch, '"' | '\\') {
+            result.push('\\');
+        }
+        result.push(ch);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -681,24 +710,6 @@ pub fn emit_access_record(ctx: &HttpFilterContext<'_>, status: u16) {
         response_body_bytes = ctx.response_body_bytes,
         "access"
     );
-}
-
-impl EmitPlan {
-    #[cfg_attr(not(test), expect(dead_code, reason = "called from unit tests only"))]
-    fn build_record(
-        &self,
-        ctx: &HttpFilterContext<'_>,
-        status: u16,
-        response_headers: Option<&http::HeaderMap>,
-        duration_ms: u64,
-    ) -> BTreeMap<String, String> {
-        match &self.shape {
-            EmitShape::JsonRecord(fields) => {
-                build_record_from_fields(fields, ctx, status, response_headers, duration_ms)
-            },
-            _ => BTreeMap::new(),
-        }
-    }
 }
 
 /// Build a record from an explicit list of field tokens.
@@ -1459,6 +1470,27 @@ conditions:
         assert!(matches!(&parts[0], TemplatePart::Field(FieldToken::RequestHeader(n)) if n == "user-agent"));
     }
 
+    #[test]
+    fn parse_template_rejects_response_header_without_allowlist() {
+        let headers = HashSet::new();
+        let err = parse_template("{response_header.content-type}", &headers, &headers).unwrap_err();
+        assert!(err.to_string().contains("response_headers"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_template_rejects_unclosed_brace_at_end() {
+        let headers = HashSet::new();
+        let err = parse_template("{method", &headers, &headers).unwrap_err();
+        assert!(err.to_string().contains("unclosed"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_template_rejects_stray_closing_brace() {
+        let headers = HashSet::new();
+        let err = parse_template("{status}}", &headers, &headers).unwrap_err();
+        assert!(err.to_string().contains("unexpected '}'"), "got: {err}");
+    }
+
     // -------------------------------------------------------------------------
     // Text rendering
     // -------------------------------------------------------------------------
@@ -1588,12 +1620,10 @@ conditions:
 
     #[test]
     fn build_record_includes_selected_fields_only() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![FieldToken::Method, FieldToken::Status]),
-        };
+        let fields = [FieldToken::Method, FieldToken::Status];
         let req = crate::test_utils::make_request(http::Method::POST, "/api");
         let ctx = crate::test_utils::make_filter_context(&req);
-        let record = plan.build_record(&ctx, 201, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 201, None, 0);
         assert_eq!(record.len(), 2);
         assert_eq!(record.get("method"), Some(&"POST".to_owned()));
         assert_eq!(record.get("status"), Some(&"201".to_owned()));
@@ -1612,14 +1642,12 @@ conditions:
     #[test]
     #[expect(clippy::too_many_lines, reason = "one assertion per rendered gRPC field")]
     fn build_record_renders_grpc_completion() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![
-                FieldToken::GrpcStatus,
-                FieldToken::GrpcStatusName,
-                FieldToken::GrpcMessage,
-                FieldToken::GrpcStatusDetailsBin,
-            ]),
-        };
+        let fields = [
+            FieldToken::GrpcStatus,
+            FieldToken::GrpcStatusName,
+            FieldToken::GrpcMessage,
+            FieldToken::GrpcStatusDetailsBin,
+        ];
         let req = grpc_request();
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let mut trailers = http::HeaderMap::new();
@@ -1628,7 +1656,7 @@ conditions:
         let _prev = trailers.insert("grpc-status-details-bin", http::HeaderValue::from_static("CAUSBG9vcHM"));
         ctx.grpc_completion = praxis_core::grpc::GrpcCompletion::from_headers(&trailers);
 
-        let record = plan.build_record(&ctx, 200, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 200, None, 0);
 
         assert_eq!(
             record.get("grpc_status"),
@@ -1668,26 +1696,22 @@ conditions:
 
     #[test]
     fn build_record_emits_filter_metadata() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![FieldToken::Metadata("llm.model".to_owned())]),
-        };
+        let fields = [FieldToken::Metadata("llm.model".to_owned())];
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.set_metadata("llm.model", "gpt-4o");
 
-        let record = plan.build_record(&ctx, 200, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 200, None, 0);
         assert_eq!(record.get("metadata.llm.model"), Some(&"gpt-4o".to_owned()));
     }
 
     #[test]
     fn build_record_dashes_absent_metadata() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![FieldToken::Metadata("llm.model".to_owned())]),
-        };
+        let fields = [FieldToken::Metadata("llm.model".to_owned())];
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let ctx = crate::test_utils::make_filter_context(&req);
 
-        let record = plan.build_record(&ctx, 200, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 200, None, 0);
         assert_eq!(
             record.get("metadata.llm.model"),
             Some(&"-".to_owned()),
@@ -1697,17 +1721,15 @@ conditions:
 
     #[test]
     fn build_record_grpc_fields_are_dashes_for_non_grpc_responses() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![
-                FieldToken::GrpcStatus,
-                FieldToken::GrpcStatusName,
-                FieldToken::GrpcMessage,
-            ]),
-        };
+        let fields = [
+            FieldToken::GrpcStatus,
+            FieldToken::GrpcStatusName,
+            FieldToken::GrpcMessage,
+        ];
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let ctx = crate::test_utils::make_filter_context(&req);
 
-        let record = plan.build_record(&ctx, 200, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 200, None, 0);
 
         assert_eq!(record.get("grpc_status"), Some(&"-".to_owned()), "no gRPC status");
         assert_eq!(record.get("grpc_status_name"), Some(&"-".to_owned()), "no gRPC name");
@@ -1731,12 +1753,10 @@ conditions:
 
     #[test]
     fn build_record_trace_id_defaults_to_dash_without_span() {
-        let plan = EmitPlan {
-            shape: EmitShape::JsonRecord(vec![FieldToken::TraceId, FieldToken::SpanId]),
-        };
+        let fields = [FieldToken::TraceId, FieldToken::SpanId];
         let req = crate::test_utils::make_request(http::Method::GET, "/");
         let ctx = crate::test_utils::make_filter_context(&req);
-        let record = plan.build_record(&ctx, 200, None, 0);
+        let record = build_record_from_fields(&fields, &ctx, 200, None, 0);
         assert_eq!(record.get("trace_id"), Some(&"-".to_owned()));
         assert_eq!(record.get("span_id"), Some(&"-".to_owned()));
     }
@@ -2155,6 +2175,28 @@ conditions:
         assert!(
             out.contains("record="),
             "small field sets must use the same record shape as large ones: {out:?}"
+        );
+    }
+
+    #[test]
+    fn template_emit_renders_response_header_through_maybe_emit() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "
+template: \"{status} {response_header.content-type}\"
+response_headers: [content-type]
+",
+        )
+        .unwrap();
+        let filter = test_filter(&yaml);
+        let req = crate::test_utils::make_request(http::Method::GET, "/api/thing");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut response_headers = http::HeaderMap::new();
+        response_headers.insert("content-type", "text/plain".parse().unwrap());
+
+        let out = capture_logs(|| filter.maybe_emit(&mut ctx, 200, Some(&response_headers)));
+        assert!(
+            out.contains("line=200 text/plain"),
+            "template emit should render the status and response header into the line field: {out:?}"
         );
     }
 

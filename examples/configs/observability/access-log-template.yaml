@@ -1,11 +1,11 @@
 # Access Log Template
 #
-# Emits a human-readable log line for each request using a configurable
-# text template. Setting `template` switches the access log from JSON to
-# a rendered text line; like JSON output, it goes through the tracing
-# subscriber. Template tokens use the same names as the `fields` tokens,
-# wrapped in braces: {method}, {path}, {status}, {duration_ms},
-# {request_id}, {client_ip}, and so on.
+# Renders a configurable text line for each request. The rendered string is
+# logged as the `line` field of the `access` event; `PRAXIS_LOG_FORMAT` still
+# decides whether the subscriber writes that event as text or JSON, exactly as
+# it does for the default and `fields` shapes. Template tokens use the same
+# names as the `fields` tokens, wrapped in braces: {method}, {path}, {status},
+# {duration_ms}, {request_id}, {client_ip}, and so on.
 #
 # Usage:
 #   cargo run -p praxis-proxy -- -c examples/configs/observability/access-log-template.yaml

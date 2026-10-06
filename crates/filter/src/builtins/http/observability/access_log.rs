@@ -2926,8 +2926,14 @@ response_headers: [content-type]
         filter.emit_access_log(&ctx, 200, None, 7);
 
         let contents = read_file_with_retry(&log_path);
-        let line = contents.lines().next().expect("file sink should write one template line");
-        assert_eq!(line, "GET /health 200", "template sink should write the rendered line, not JSON");
+        let line = contents
+            .lines()
+            .next()
+            .expect("file sink should write one template line");
+        assert_eq!(
+            line, "GET /health 200",
+            "template sink should write the rendered line, not JSON"
+        );
     }
 
     #[test]

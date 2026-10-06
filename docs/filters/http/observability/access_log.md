@@ -17,8 +17,9 @@ Logs structured access records for each request and response.
 | `conditions.min_duration_ms` | integer | no |  |
 | `conditions.status_classes` | (`1xx` \| `2xx` \| `3xx` \| `4xx` \| `5xx`)[] | no |  |
 | `conditions.paths` | string[] | no |  |
-| `sink` | `Stdout` \| `File` | no | Output sink: `{type: stdout}` or `{type: file, path: ...}`. Omitted means emit through the tracing subscriber. |
-| `sink.path` | string | yes | Destination path, opened in append+create mode. |
+| `sink` | SinkConfig | no | Output sink: `{type: stdout}` or `{type: file, path: ...}`. Omitted means emit through the tracing subscriber. |
+| `sink.type` | `stdout` \| `file` | yes | Sink kind (`stdout` or `file`). |
+| `sink.path` | string | no | File path; required for `file`, rejected for `stdout`. |
 
 ## Example
 

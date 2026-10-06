@@ -13,14 +13,17 @@ use std::{
     io::BufWriter,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use http::header::HeaderName;
 use serde::Deserialize;
 use tracing::info;
@@ -287,7 +290,7 @@ enum RuntimeSink {
     /// Emit via `tracing::info!`; the subscriber controls the format.
     Tracing,
     /// Write NDJSON lines to a background writer (stdout or a file).
-    Direct(DirectSink),
+    Direct(Arc<DirectSink>),
 }
 
 /// Bounded queue capacity for a direct sink's background writer. Records are
@@ -295,23 +298,40 @@ enum RuntimeSink {
 /// sink can never block a request executor thread.
 const SINK_QUEUE_CAPACITY: usize = 8_192;
 
+/// How often an idle writer wakes to observe [`SINK_SHUTDOWN`]. Bounds how long
+/// `shutdown_sinks` waits for a quiescent writer (e.g. stdout, whose sender
+/// never drops) to notice the flag and exit.
+const SINK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll interval while waiting for a writer to finish during shutdown.
+const SINK_JOIN_POLL: Duration = Duration::from_millis(5);
+
+/// Set once at process shutdown so idle writers flush and exit even when their
+/// sender never drops (the stdout singleton), making their handles joinable.
+static SINK_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Join handles for every spawned writer thread, drained and joined by
+/// [`shutdown_sinks`]. Finished handles are pruned as new writers register.
+static SINK_WRITERS: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
+
 /// Handle to a background NDJSON writer shared by every filter instance that
 /// targets the same destination.
 ///
 /// Emitting hands an owned line to a bounded channel and returns immediately;
 /// the blocking write and flush happen on a dedicated writer thread. A full
 /// channel drops the line (counted, with a rate-limited warning) rather than
-/// stalling the request path.
-#[derive(Clone)]
+/// stalling the request path. Filters hold an `Arc<DirectSink>`; the file
+/// registry keeps only a `Weak`, so the writer thread exits once the last
+/// filter using a path is dropped (for example after a config reload).
 struct DirectSink {
     /// Sender into the writer thread's bounded queue.
     tx: SyncSender<String>,
     /// Destination label for diagnostics (`"stdout"` or the file path).
     dest: Arc<str>,
     /// Count of lines dropped because the queue was full.
-    dropped: Arc<AtomicU64>,
+    dropped: AtomicU64,
     /// Unix-seconds timestamp of the last drop warning, for rate limiting.
-    last_drop_warn: Arc<AtomicU64>,
+    last_drop_warn: AtomicU64,
 }
 
 impl DirectSink {
@@ -320,8 +340,8 @@ impl DirectSink {
         Self {
             tx,
             dest,
-            dropped: Arc::new(AtomicU64::new(0)),
-            last_drop_warn: Arc::new(AtomicU64::new(0)),
+            dropped: AtomicU64::new(0),
+            last_drop_warn: AtomicU64::new(0),
         }
     }
 
@@ -371,58 +391,142 @@ fn unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Drain the queue onto `writer`, batching available lines before each flush
-/// and reporting (rate-limited) failures. Returns when every sender is dropped.
-fn run_sink_writer<W: std::io::Write>(mut writer: W, rx: &Receiver<String>, dest: &str) {
+/// RFC 3339 UTC timestamp (millisecond precision) for a sink record, taken from
+/// the request's clock abstraction so tests can pin it, mirroring `cloud_events`.
+fn sink_timestamp(ctx: &HttpFilterContext<'_>) -> String {
+    let now = ctx.time_source.now();
+    DateTime::<Utc>::from_timestamp(i64::try_from(now.as_secs()).unwrap_or(i64::MAX), now.subsec_nanos()).map_or_else(
+        || "1970-01-01T00:00:00.000Z".to_owned(),
+        |time| time.to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+}
+
+/// Write `first` and any further queued lines, then flush once, reporting
+/// (rate-limited) write or flush failures.
+fn flush_batch<W: std::io::Write>(
+    writer: &mut W,
+    rx: &Receiver<String>,
+    throttle: &mut WriteWarnThrottle,
+    dest: &str,
+    first: &str,
+) {
+    let mut result = writeln!(writer, "{first}");
+    // Write any further queued lines before paying for a single flush.
+    while result.is_ok() {
+        match rx.try_recv() {
+            Ok(next) => result = writeln!(writer, "{next}"),
+            Err(_) => break,
+        }
+    }
+    if let Err(e) = result.and_then(|()| writer.flush()) {
+        throttle.warn(dest, &e);
+    }
+}
+
+/// Drain the queue onto `writer`, batching available lines before each flush and
+/// reporting (rate-limited) failures. Returns when every sender is dropped or
+/// `shutdown` is set, flushing whatever is still queued first. `shutdown` is
+/// injected (rather than read from [`SINK_SHUTDOWN`] directly) so the exit path
+/// is unit-testable in isolation.
+fn run_sink_writer<W: std::io::Write>(mut writer: W, rx: &Receiver<String>, dest: &str, shutdown: &AtomicBool) {
     let mut throttle = WriteWarnThrottle::default();
-    while let Ok(line) = rx.recv() {
-        let mut result = writeln!(writer, "{line}");
-        // Write any further queued lines before paying for a single flush.
-        while result.is_ok() {
-            match rx.try_recv() {
-                Ok(next) => result = writeln!(writer, "{next}"),
-                Err(_) => break,
-            }
+    loop {
+        match rx.recv_timeout(SINK_POLL_INTERVAL) {
+            Ok(line) => flush_batch(&mut writer, rx, &mut throttle, dest, &line),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shutdown.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => {},
         }
-        if let Err(e) = result.and_then(|()| writer.flush()) {
-            throttle.warn(dest, &e);
-        }
+    }
+    // Flush records queued between the last receive and the exit condition.
+    if let Ok(line) = rx.try_recv() {
+        flush_batch(&mut writer, rx, &mut throttle, dest, &line);
     }
     drop(writer.flush());
 }
 
-/// Spawn the dedicated writer thread for a destination.
+/// Spawn the dedicated writer thread for a destination and register its handle
+/// for shutdown.
 ///
-/// On the rare spawn failure the sink is left without a writer; its queue then
-/// fills and records drop with the usual warning rather than bringing the proxy
-/// down.
-fn spawn_sink_writer<W: std::io::Write + Send + 'static>(writer: W, rx: Receiver<String>, dest: Arc<str>) {
-    let result = std::thread::Builder::new()
+/// The caller must only cache the sink once this succeeds: a dropped `rx` would
+/// make every send fail as "disconnected" while a dead sink lingered until
+/// restart.
+fn spawn_sink_writer<W: std::io::Write + Send + 'static>(
+    writer: W,
+    rx: Receiver<String>,
+    dest: Arc<str>,
+) -> std::io::Result<()> {
+    let handle = std::thread::Builder::new()
         .name("access-log-sink".to_owned())
-        .spawn(move || run_sink_writer(writer, &rx, &dest));
-    if let Err(e) = result {
-        tracing::error!(error = %e, "failed to spawn access_log sink writer thread");
+        .spawn(move || run_sink_writer(writer, &rx, &dest, &SINK_SHUTDOWN))?;
+    register_sink_writer(handle);
+    Ok(())
+}
+
+/// Record a writer's join handle so [`shutdown_sinks`] can drain it, pruning
+/// handles whose threads already finished (e.g. writers replaced by a reload).
+fn register_sink_writer(handle: JoinHandle<()>) {
+    let registry = SINK_WRITERS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|existing| !existing.is_finished());
+    guard.push(handle);
+}
+
+/// Signal every access-log sink writer to flush and exit, then wait up to
+/// `timeout` (total) for them to finish before the process exits.
+///
+/// Writers already flush after each batch, so this only recovers records still
+/// queued at shutdown. A writer that has not finished by the deadline is left to
+/// the exiting process rather than blocking it, matching the drop-on-overflow
+/// queue: the sink is best-effort, never the system of record.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded synchronous wait during process shutdown, not on the async runtime"
+)]
+pub fn shutdown_sinks(timeout: Duration) {
+    SINK_SHUTDOWN.store(true, Ordering::Release);
+    let Some(registry) = SINK_WRITERS.get() else {
+        return;
+    };
+    let handles: Vec<JoinHandle<()>> = {
+        let mut guard = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut guard)
+    };
+    let deadline = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
+    for handle in handles {
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(SINK_JOIN_POLL);
+        }
+        if handle.is_finished() {
+            drop(handle.join());
+        }
     }
 }
 
 /// The process-wide stdout sink, created on first use.
-fn stdout_sink() -> DirectSink {
-    static STDOUT: OnceLock<DirectSink> = OnceLock::new();
-    STDOUT
-        .get_or_init(|| {
-            let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
-            let dest: Arc<str> = Arc::from("stdout");
-            spawn_sink_writer(std::io::stdout(), rx, Arc::clone(&dest));
-            DirectSink::new(tx, dest)
-        })
-        .clone()
+///
+/// Returns an error if the writer thread cannot be spawned so the sink is never
+/// cached without a live writer behind it.
+fn stdout_sink() -> Result<Arc<DirectSink>, FilterError> {
+    static STDOUT: OnceLock<Arc<DirectSink>> = OnceLock::new();
+    if let Some(sink) = STDOUT.get() {
+        return Ok(Arc::clone(sink));
+    }
+    let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
+    let dest: Arc<str> = Arc::from("stdout");
+    spawn_sink_writer(std::io::stdout(), rx, Arc::clone(&dest))
+        .map_err(|e| format!("access_log: cannot start stdout sink writer: {e}"))?;
+    // A concurrent first-init may have stored its sink first; keep that one and
+    // let this writer thread exit when its unused sender drops. stdout lives for
+    // the whole process, so this handle is intentionally never reclaimed.
+    Ok(Arc::clone(STDOUT.get_or_init(|| Arc::new(DirectSink::new(tx, dest)))))
 }
 
 /// A file sink for `path`, shared across filter instances that name the same
 /// destination so a single writer and queue serialize all writes and NDJSON
 /// records never interleave.
-fn file_sink(path: &str) -> Result<DirectSink, FilterError> {
-    static FILES: OnceLock<Mutex<HashMap<PathBuf, DirectSink>>> = OnceLock::new();
+fn file_sink(path: &str) -> Result<Arc<DirectSink>, FilterError> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<DirectSink>>>> = OnceLock::new();
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -433,15 +537,15 @@ fn file_sink(path: &str) -> Result<DirectSink, FilterError> {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
     let registry = FILES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(sink) = guard.get(&key) {
-        // Another instance already owns this destination; drop our extra handle.
-        return Ok(sink.clone());
+    if let Some(sink) = guard.get(&key).and_then(Weak::upgrade) {
+        return Ok(sink);
     }
     let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
     let dest: Arc<str> = Arc::from(path);
-    spawn_sink_writer(BufWriter::new(file), rx, Arc::clone(&dest));
-    let sink = DirectSink::new(tx, dest);
-    guard.insert(key, sink.clone());
+    spawn_sink_writer(BufWriter::new(file), rx, Arc::clone(&dest))
+        .map_err(|e| format!("access_log: cannot start writer for log file {path:?}: {e}"))?;
+    let sink = Arc::new(DirectSink::new(tx, dest));
+    guard.insert(key, Arc::downgrade(&sink));
     drop(guard);
     Ok(sink)
 }
@@ -661,7 +765,10 @@ impl AccessLogFilter {
     /// Format one NDJSON line for a direct sink (stdout or file).
     ///
     /// Both the default and projected plans serialize the same `build_record`
-    /// map, so a direct sink always emits a single JSON object per request.
+    /// map, so a direct sink always emits a single JSON object per request. A
+    /// `timestamp` key (RFC 3339 UTC, millisecond precision) is injected so a
+    /// file log records when each request completed; the tracing path gets this
+    /// from the subscriber instead.
     fn format_line_for_sink(
         &self,
         ctx: &HttpFilterContext<'_>,
@@ -669,7 +776,8 @@ impl AccessLogFilter {
         response_headers: Option<&http::HeaderMap>,
         duration_ms: u64,
     ) -> String {
-        let record = self.emit_plan.build_record(ctx, status, response_headers, duration_ms);
+        let mut record = self.emit_plan.build_record(ctx, status, response_headers, duration_ms);
+        record.insert("timestamp".to_owned(), sink_timestamp(ctx));
         serde_json::to_string(&record).unwrap_or_default()
     }
 
@@ -1199,7 +1307,7 @@ fn emit_projected_record(record: &BTreeMap<String, String>) {
 fn build_runtime_sink(sink_cfg: Option<SinkConfig>) -> Result<RuntimeSink, FilterError> {
     match sink_cfg {
         None => Ok(RuntimeSink::Tracing),
-        Some(SinkConfig::Stdout) => Ok(RuntimeSink::Direct(stdout_sink())),
+        Some(SinkConfig::Stdout) => Ok(RuntimeSink::Direct(stdout_sink()?)),
         Some(SinkConfig::File { path }) => Ok(RuntimeSink::Direct(file_sink(&path)?)),
     }
 }
@@ -2162,6 +2270,38 @@ conditions:
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "sync sink test polls with thread::sleep")]
+    fn file_sink_writes_even_when_info_level_disabled() {
+        // A file sink bypasses tracing, so the INFO gate must not suppress it:
+        // with RUST_LOG=warn a file sink would otherwise silently lose every
+        // record, including rejections and upstream failures.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("access.log");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap())).unwrap();
+        let filter = test_filter(&yaml);
+
+        let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (path, status) in [("/ok", 200), ("/err", 500)] {
+                let req = crate::test_utils::make_request(http::Method::GET, path);
+                let mut ctx = crate::test_utils::make_filter_context(&req);
+                filter.maybe_emit(&mut ctx, status, None);
+            }
+        });
+
+        let mut lines = 0;
+        for _ in 0..100 {
+            lines = std::fs::read_to_string(&log_path).unwrap_or_default().lines().count();
+            if lines == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(lines, 2, "both records must reach the file sink despite the INFO gate");
+    }
+
+    #[test]
     fn maybe_emit_gates_by_status_and_emits_stable_record() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
             "
@@ -2361,7 +2501,7 @@ conditions:
             {
                 return contents;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20));
         }
         std::fs::read_to_string(path).unwrap_or_default()
     }
@@ -2428,6 +2568,11 @@ conditions:
         assert_eq!(record.get("method").map(String::as_str), Some("GET"));
         assert_eq!(record.get("path").map(String::as_str), Some("/health"));
         assert_eq!(record.get("status").map(String::as_str), Some("200"));
+        let timestamp = record.get("timestamp").expect("sink record must carry a timestamp");
+        assert!(
+            timestamp.contains('T') && timestamp.ends_with('Z'),
+            "timestamp should be RFC 3339 UTC: {timestamp:?}"
+        );
     }
 
     #[test]
@@ -2441,10 +2586,24 @@ conditions:
         // their NDJSON records never interleave, even under concurrency.
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("shared.log");
-        let cfg = format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap());
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&cfg).unwrap();
-        let filter_a = Arc::new(test_filter(&yaml));
-        let filter_b = Arc::new(test_filter(&yaml));
+        let cfg_a = format!("sink:\n  type: file\n  path: {}", log_path.to_str().unwrap());
+        // A different spelling of the same file (a `.` segment) must canonicalize
+        // to the same registry key, so both filters resolve to one writer.
+        let alt_path = dir.path().join(".").join("shared.log");
+        let cfg_b = format!("sink:\n  type: file\n  path: {}", alt_path.to_str().unwrap());
+        let filter_a = Arc::new(test_filter(&serde_yaml::from_str(&cfg_a).unwrap()));
+        let filter_b = Arc::new(test_filter(&serde_yaml::from_str(&cfg_b).unwrap()));
+
+        // Both filters must share one `DirectSink`, which the canonical-key
+        // registry proves by handing back the same `Arc`.
+        let sink = |filter: &AccessLogFilter| match &filter.sink {
+            RuntimeSink::Direct(sink) => Arc::clone(sink),
+            RuntimeSink::Tracing => panic!("file sink should resolve to a direct sink"),
+        };
+        assert!(
+            Arc::ptr_eq(&sink(&filter_a), &sink(&filter_b)),
+            "both path spellings should resolve to a single shared writer"
+        );
 
         let per_thread = 200;
         let handles: Vec<_> = [(filter_a, "/a"), (filter_b, "/b")]
@@ -2475,8 +2634,30 @@ conditions:
             if lines == per_thread * 2 {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(lines, per_thread * 2, "all records from both filters should be written");
+    }
+
+    #[test]
+    fn run_sink_writer_flushes_queue_then_exits_on_shutdown_flag() {
+        // A writer whose sender never drops (like stdout) still exits once the
+        // shutdown flag is set, after flushing everything already queued.
+        let (tx, rx) = sync_channel::<String>(8);
+        tx.send("alpha".to_owned()).unwrap();
+        tx.send("beta".to_owned()).unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let mut buf: Vec<u8> = Vec::new();
+        // Returns because the flag is set, not because the sender dropped: `tx`
+        // is deliberately held live across the call.
+        run_sink_writer(&mut buf, &rx, "test", &shutdown);
+        drop(tx);
+
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "alpha\nbeta\n",
+            "shutdown must flush records queued before the flag was set"
+        );
     }
 }

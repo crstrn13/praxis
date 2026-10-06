@@ -18,6 +18,9 @@ Logs structured access records for each request and response.
 | `conditions.status_classes` | (`1xx` \| `2xx` \| `3xx` \| `4xx` \| `5xx`)[] | no |  |
 | `conditions.paths` | string[] | no |  |
 | `template` | string | no | Text template with `{field}` placeholders. The rendered string is logged as the `line` field of the `access` event, and `PRAXIS_LOG_FORMAT` still decides text or JSON output. Mutually exclusive with `fields`. |
+| `sink` | SinkConfig | no | Output sink: `{type: stdout}` or `{type: file, path: ...}`. Omitted means emit through the tracing subscriber. |
+| `sink.type` | `stdout` \| `file` | yes | Sink kind (`stdout` or `file`). |
+| `sink.path` | string | no | File path; required for `file`, rejected for `stdout`. |
 
 ## Examples
 
@@ -39,6 +42,9 @@ conditions:                   # optional emit-time gates (AND across keys)
   min_duration_ms: 1000
   status_classes: [4xx, 5xx]  # OR within list
   paths: ["/api"]             # OR within list; segment-boundary prefixes
+sink:                         # optional; default emits via the subscriber
+  type: file                  # `stdout` or `file`
+  path: /var/log/praxis/access.log  # required for `file`, rejected for `stdout`
 ```
 
 ### Example 2

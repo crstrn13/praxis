@@ -1,48 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024 Praxis Contributors
 
-//! Origin extraction and matching logic for the CSRF filter.
+//! Origin extraction logic for the CSRF filter.
 
 use http::HeaderMap;
 
-use super::super::{
-    origin_matcher::{OriginMatcher, build_origin_matcher},
-    origin_normalize::normalize_origin,
-};
-
-// -----------------------------------------------------------------------------
-// TrustedOrigins
-// -----------------------------------------------------------------------------
-
-/// CSRF-specific wrapper around [`OriginMatcher`].
-///
-/// Exposes `is_trusted()` for CSRF semantics while
-/// delegating matching to the shared implementation.
-///
-/// [`OriginMatcher`]: super::super::origin_matcher::OriginMatcher
-pub(super) struct TrustedOrigins(OriginMatcher);
-
-impl TrustedOrigins {
-    /// Check whether `origin` is trusted.
-    pub(super) fn is_trusted(&self, origin: &str) -> bool {
-        self.0.is_allowed(origin)
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Builder
-// -----------------------------------------------------------------------------
-
-/// Build the [`TrustedOrigins`] from the configured origins list.
-///
-/// Configured origins are normalized so that default ports
-/// (`:443` for HTTPS, `:80` for HTTP) are stripped before
-/// insertion, ensuring [RFC 6454] equivalence.
-///
-/// [RFC 6454]: https://datatracker.ietf.org/doc/html/rfc6454
-pub(super) fn build_trusted_origins(origins: &[String]) -> TrustedOrigins {
-    TrustedOrigins(build_origin_matcher(origins))
-}
+use super::super::origin_normalize::normalize_origin;
 
 // -----------------------------------------------------------------------------
 // Origin Extraction
@@ -79,10 +42,12 @@ pub(super) fn extract_origin(headers: &HeaderMap) -> Option<std::borrow::Cow<'_,
 ///
 /// The authority ends at the first `/`, `?`, or `#` (RFC 3986 §3.2), so a
 /// path-less URL such as `https://example.com#frag` still yields a bare origin.
+/// An authority carrying userinfo (`user@host`) is rejected: browsers strip
+/// credentials from `Referer`, so its presence indicates a forged header.
 fn extract_origin_from_url(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let host_port = rest.split(['/', '?', '#']).next()?;
-    if host_port.is_empty() {
+    if host_port.is_empty() || host_port.contains('@') {
         return None;
     }
     Some(format!("{scheme}://{host_port}"))

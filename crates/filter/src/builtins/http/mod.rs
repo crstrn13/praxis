@@ -9,13 +9,13 @@ pub mod payload_processing;
 mod security;
 mod traffic_management;
 mod transformation;
-pub mod value_safety;
+pub(crate) mod value_safety;
 
 #[cfg(feature = "cloud-events-filter")]
 pub use observability::CloudEventsFilter;
 pub use observability::{
     AccessLogFilter, RequestIdFilter, TraceContextFilter, access_record_already_emitted, bodyless_response,
-    emit_access_record, mark_access_record_emitted,
+    emit_access_record, mark_access_record_emitted, shutdown_access_log_sinks,
 };
 pub use payload_processing::{
     CompressionFilter, GrpcWebFilter, JsonBodyFieldFilter, JsonBodyFilter, JsonBodyOps, JsonRpcFilter,

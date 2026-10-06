@@ -46,6 +46,7 @@ See [Quickstart](../docs/quickstart.md#quick-test-servers) for full options.
 | [named-chain-ref.yaml](configs/branching/named-chain-ref.yaml) | A branch references a top-level chain by name instead of defining filters inline |
 | [nested-branches.yaml](configs/branching/nested-branches.yaml) | Branch filters that themselves contain branches, forming a multi-level decision tree |
 | [reentrance.yaml](configs/branching/reentrance.yaml) | Loops back to a named filter up to N times |
+| [result-matchers.yaml](configs/branching/result-matchers.yaml) | Builds a deny-by-default JSON-RPC allowlist out of branch result matchers |
 | [unconditional-branch.yaml](configs/branching/unconditional-branch.yaml) | Always runs a utility chain before continuing the main pipeline |
 
 ### Observability
@@ -53,6 +54,7 @@ See [Quickstart](../docs/quickstart.md#quick-test-servers) for full options.
 | File | Description |
 | ------ | ------------- |
 | [access-log-fields.yaml](configs/observability/access-log-fields.yaml) | Logs only server errors with a lean field set |
+| [access-log-file-sink.yaml](configs/observability/access-log-file-sink.yaml) | Writes NDJSON access log records directly to a file, bypassing the tracing subscriber |
 | [access-log-template.yaml](configs/observability/access-log-template.yaml) | Renders a configurable text line for each request |
 | [access-logging.yaml](configs/observability/access-logging.yaml) | Structured JSON logging with sampling; logs ~10% of requests. request_id ensures each log line has a correlation ID. access_log emits method, path, status, and timing |
 | [cloud-events.yaml](configs/observability/cloud-events.yaml) | Publishes a bounded, best-effort CloudEvents 1.0 response event after the upstream response completes |
@@ -111,8 +113,10 @@ See [Quickstart](../docs/quickstart.md#quick-test-servers) for full options.
 | [conditional-filters.yaml](configs/pipeline/conditional-filters.yaml) | Filters support `conditions` (request phase) and `response_conditions` (response phase) to gate execution |
 | [failure-mode.yaml](configs/pipeline/failure-mode.yaml) | Demonstrates open and closed failure handling for filters |
 | [grpc-condition.yaml](configs/pipeline/grpc-condition.yaml) | The `grpc` condition predicate gates a filter on whether the request carries gRPC, classified from the `content-type` header alone (`application/grpc`, `application/grpc+proto`, `application/grpc+json`, or any other `application/grpc+<codec>`) |
+| [header-presence-condition.yaml](configs/pipeline/header-presence-condition.yaml) | The `headers_present` condition predicate gates a filter on whether headers are present, whatever their values |
 | [iterative-request-router-circuit-breaker.yaml](configs/pipeline/iterative-request-router-circuit-breaker.yaml) | Demonstrates circuit breaker integration with the iterative request router |
 | [iterative-request-router-sequence.yaml](configs/pipeline/iterative-request-router-sequence.yaml) | Demonstrates sequential sub-request execution where each step completes before the next begins |
+| [route-on-promoted-header.yaml](configs/pipeline/route-on-promoted-header.yaml) | Classify a request in an early filter, promote the result to a reserved `x-praxis-*` header, and route on that header |
 | [selected-upstream-conditions.yaml](configs/pipeline/selected-upstream-conditions.yaml) | Gate a filter on the application metadata the load balancer publishes when it selects an upstream |
 
 ### Protocols
@@ -150,6 +154,7 @@ See [Quickstart](../docs/quickstart.md#quick-test-servers) for full options.
 | ------ | ------------- |
 | [basic-auth.yaml](configs/security/basic-auth.yaml) | Authenticate requests using HTTP Basic Authentication (RFC 7617) |
 | [cors.yaml](configs/security/cors.yaml) | Spec-compliant CORS filter with preflight handling, origin validation, and credential support |
+| [credential-injection-env-vars.yaml](configs/security/credential-injection-env-vars.yaml) | Injects per-service API credentials read from environment variables, so no secret is written into the config |
 | [credential-injection.yaml](configs/security/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests |
 | [csrf.yaml](configs/security/csrf.yaml) | Cross-site request forgery protection via origin validation |
 | [downstream-read-timeout.yaml](configs/security/downstream-read-timeout.yaml) | Protects against slow client attacks by limiting how long the proxy waits for data from downstream clients |
@@ -168,6 +173,7 @@ See [Quickstart](../docs/quickstart.md#quick-test-servers) for full options.
 
 | File | Description |
 | ------ | ------------- |
+| [authority-from-endpoint.yaml](configs/traffic-management/authority-from-endpoint.yaml) | Sends each upstream request's Host header as the address of the endpoint the load balancer picked, so one cluster can front endpoints that answer to different hostnames |
 | [authority-override.yaml](configs/traffic-management/authority-override.yaml) | Demonstrates overriding the HTTP Host header sent to a specific upstream cluster, including requests received over HTTP/2 |
 | [basic-reverse-proxy.yaml](configs/traffic-management/basic-reverse-proxy.yaml) | Minimal config: one listener, one upstream, default filter chain |
 | [bound-upstream-condition.yaml](configs/traffic-management/bound-upstream-condition.yaml) | Gates a filter on the logical upstream the router bound for the request |

@@ -25,8 +25,9 @@ ambiguous configuration:
   [Admin DNS Rebinding](#admin-dns-rebinding)).
 - `unsafe_code = "deny"` in workspace lints; no unsafe
   Rust in the Praxis codebase.
-- Rustls for TLS (no OpenSSL, no C FFI in the TLS
-  path).
+- Rustls protocol state machine for TLS;
+  cryptography via the system OpenSSL
+  (rustls-openssl provider).
 - TLS certificate and key paths reject directory
   traversal (`..`).
 - Health check targets reject loopback, link-local,
@@ -159,6 +160,16 @@ relying on the bind address.
   `crl_paths` to the `client_ca` block. CRL paths
   reject directory traversal (`..`). See
   [tls.md](tls.md) for configuration details.
+- CRL and client CA files reload only on listeners
+  with exactly one certificate and `hot_reload` not
+  set to `false`. Every other listener needs a
+  restart to pick up a new CRL.
+- For upstream TLS, set `tls.sni` to the name on the
+  backend certificate, especially for a hostname
+  behind a load balancer. With
+  `authority: { from: endpoint }` and no `tls.sni`,
+  each endpoint is verified against its own hostname,
+  or an IP endpoint against the certificate's IP SAN.
 
 ## Access Control
 
@@ -190,7 +201,11 @@ relying on the bind address.
   duplicate slashes (`//`), or percent-decode the
   path before matching, and it forwards the path to
   the upstream verbatim (this is deliberate — see the
-  `%2f`/`//` passthrough behavior). A request such as
+  `%2f`/`//` passthrough behavior). The one exception:
+  requests whose path has a `..` segment (including
+  `%2e%2e`) are rejected with 400 before any filter
+  runs, so `/public/../admin` cannot match a `/public`
+  route and reach `/admin` upstream. A request such as
   `//admin` or `/%2e/admin` will therefore *not* match
   a `path_prefix: /admin` gate, yet an upstream that
   normalizes the path may still treat it as `/admin`.
@@ -250,6 +265,15 @@ in development:
 - **`verify: false`** on upstream TLS: Disables
   certificate verification. Acceptable only for
   local development with self-signed certs.
+- **`allow_tls_without_sni`**: Lets a verifying TLS
+  cluster run with neither `tls.sni` nor
+  `authority: { from: endpoint }`. The certificate is
+  then checked against the cluster's fixed
+  `authority` if set, else the client's `Host`
+  header, so a client picks which name the backend
+  must prove. When that is not a hostname, the
+  endpoint address is used instead. Set `tls.sni`
+  instead of enabling this.
 - **Binding to `0.0.0.0`**: Exposes the listener on
   all interfaces. Use specific addresses in
   production.

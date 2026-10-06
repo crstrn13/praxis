@@ -211,7 +211,7 @@ pub(crate) fn strip_hop_by_hop_header_map(headers: &mut HeaderMap, static_list: 
 pub(crate) fn strip_reserved_internal_header_map(headers: &mut HeaderMap) {
     let to_remove: Vec<http::HeaderName> = headers
         .keys()
-        .filter(|name| super::reserved_headers::is_reserved_internal_header(name))
+        .filter(|name| praxis_core::reserved_headers::is_reserved(name.as_str()))
         .cloned()
         .collect();
 
@@ -249,7 +249,7 @@ pub(crate) trait RemoveHeader {
         let to_remove: Vec<http::HeaderName> = self
             .headers()
             .keys()
-            .filter(|name| super::reserved_headers::is_reserved_internal_header(name))
+            .filter(|name| praxis_core::reserved_headers::is_reserved(name.as_str()))
             .cloned()
             .collect();
 
@@ -340,6 +340,23 @@ mod tests {
             headers.get("content-type").map(http::HeaderValue::as_bytes),
             Some(b"text/plain".as_slice()),
             "non-reserved headers must be preserved"
+        );
+    }
+
+    #[test]
+    fn strip_reserved_internal_header_map_cleans_response_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-praxis-foo", http::HeaderValue::from_static("leak"));
+        trailers.insert("x-ext-agent-x", http::HeaderValue::from_static("leak"));
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+
+        strip_reserved_internal_header_map(&mut trailers);
+
+        assert_eq!(trailers.len(), 1, "only the non-reserved trailer must remain");
+        assert_eq!(
+            trailers.get("grpc-status").map(http::HeaderValue::as_bytes),
+            Some(b"0".as_slice()),
+            "grpc-status trailer must be preserved"
         );
     }
 

@@ -4,7 +4,7 @@
 //! Cluster validation: endpoints, weights, SNI hostnames, timeouts, and health check addresses.
 
 mod application;
-mod authority;
+pub(in crate::config) mod authority;
 mod endpoints;
 mod health_check;
 mod load_balancer;
@@ -14,11 +14,6 @@ mod tls;
 pub use health_check::is_ssrf_sensitive;
 
 use crate::{config::InsecureOptions, errors::ProxyError};
-
-/// Validate the configured authority override for one cluster.
-pub(in crate::config) fn validate_authority(authority: &str, cluster_name: &str) -> Result<(), ProxyError> {
-    authority::validate_authority(authority, cluster_name)
-}
 
 // -----------------------------------------------------------------------------
 // Cluster Validation Constants
@@ -262,6 +257,61 @@ clusters:
       authority: "api.example.com:8443"
 "#;
         Config::from_yaml(yaml).unwrap();
+    }
+
+    #[test]
+    fn accept_cluster_with_endpoint_authority() {
+        let yaml = r#"
+listeners:
+  - name: web
+    address: "0.0.0.0:80"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+clusters:
+  - name: api
+    endpoints: ["api-a.example.com:443", "api-b.example.com:443"]
+    http:
+      authority: { from: endpoint }
+    tls: {}
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(
+            config.clusters[0]
+                .http
+                .authority
+                .as_ref()
+                .is_some_and(crate::config::UpstreamAuthority::follows_endpoint),
+            "authority should parse as the endpoint-derived form"
+        );
+    }
+
+    #[test]
+    fn reject_cluster_with_unknown_authority_source() {
+        let yaml = r#"
+listeners:
+  - name: web
+    address: "0.0.0.0:80"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+clusters:
+  - name: api
+    endpoints: ["10.0.0.1:80"]
+    http:
+      authority: { from: upstream }
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("upstream"),
+            "the unknown authority source should be named: {err}"
+        );
     }
 
     #[test]

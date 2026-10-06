@@ -5,9 +5,11 @@
 //!
 //! Scans every filter's [`BodyAccess`] and [`BodyMode`] declarations to
 //! produce a single [`BodyCapabilities`] that the handler layer uses to
-//! decide whether to enable body filter hooks. Mode merging picks the
-//! most demanding mode (`StreamBuffer` > `SizeLimit` > `Stream`) and
-//! keeps the largest buffer limit so every filter gets enough data.
+//! decide whether to enable body filter hooks. Mode merging promotes the
+//! pipeline to `StreamBuffer` if any filter requests it, keeping the
+//! largest buffer limit so every filter gets enough data. A
+//! filter-declared `SizeLimit` is ignored by the merge; `SizeLimit` is
+//! reserved for the listener body ceiling applied by `apply_body_limits`.
 //!
 //! Called once at pipeline build time by [`FilterPipeline::from_filters`].
 //!
@@ -47,11 +49,12 @@ pub(super) fn merge_optional_limits(a: Option<usize>, b: Option<usize>) -> Optio
 
 /// Merge a filter's body mode into the current accumulated mode.
 ///
-/// Precedence: `StreamBuffer` > `SizeLimit` > `Stream`.
-/// When two `StreamBuffer` modes merge, the **largest** limit wins
-/// so that every filter gets enough buffer to do its job. The
-/// pipeline-level body ceiling is applied separately and acts as the
-/// hard safety cap.
+/// Only a filter's `StreamBuffer` changes the accumulated mode: it
+/// replaces `Stream` or `SizeLimit`, and when two `StreamBuffer` modes
+/// merge, the **largest** limit wins so that every filter gets enough
+/// buffer to do its job. A filter-declared `SizeLimit` (and `Stream`) is
+/// ignored here; `SizeLimit` is reserved for the listener body ceiling,
+/// which `apply_body_limits` applies separately as the hard safety cap.
 pub(crate) fn merge_body_mode(current: &mut BodyMode, filter_mode: BodyMode) {
     match filter_mode {
         BodyMode::StreamBuffer { max_bytes } => {
@@ -401,7 +404,7 @@ fn resp_conditions_use_headers(conditions: &[ResponseCondition]) -> bool {
         let m = match c {
             ResponseCondition::When(m) | ResponseCondition::Unless(m) => m,
         };
-        m.headers.is_some()
+        m.headers.is_some() || m.headers_present.is_some()
     })
 }
 
@@ -525,6 +528,7 @@ mod tests {
         let conds = vec![ResponseCondition::When(ResponseConditionMatch {
             status: None,
             headers: Some(HashMap::from([("x-key".to_owned(), "val".to_owned())])),
+            headers_present: None,
         })];
         assert!(
             resp_conditions_use_headers(&conds),
@@ -533,10 +537,24 @@ mod tests {
     }
 
     #[test]
+    fn resp_conditions_use_headers_counts_the_headers_present_predicate() {
+        let conds = vec![ResponseCondition::Unless(ResponseConditionMatch {
+            status: Some(vec![200]),
+            headers: None,
+            headers_present: Some(vec!["cache-control".to_owned()]),
+        })];
+        assert!(
+            resp_conditions_use_headers(&conds),
+            "a headers_present predicate reads response headers too"
+        );
+    }
+
+    #[test]
     fn resp_conditions_use_headers_false_when_status_only() {
         let conds = vec![ResponseCondition::When(ResponseConditionMatch {
             status: Some(vec![200]),
             headers: None,
+            headers_present: None,
         })];
         assert!(
             !resp_conditions_use_headers(&conds),
@@ -557,6 +575,7 @@ mod tests {
         let conds = vec![ResponseCondition::Unless(ResponseConditionMatch {
             status: None,
             headers: Some(HashMap::from([("x-skip".to_owned(), "yes".to_owned())])),
+            headers_present: None,
         })];
         assert!(
             resp_conditions_use_headers(&conds),
@@ -589,6 +608,7 @@ mod tests {
         let conditions = vec![ResponseCondition::When(ResponseConditionMatch {
             status: Some(vec![200]),
             headers: None,
+            headers_present: None,
         })];
         let filter = PipelineFilter::new(0, AnyFilter::Http(Box::new(ResponseBodyFilter)), vec![], conditions);
         let caps = compute_body_capabilities(&[filter]);
@@ -1313,6 +1333,7 @@ mod tests {
             path_prefix: None,
             methods: None,
             headers: None,
+            headers_present: None,
             bound_upstream: Some(ApplicationMatch {
                 application_protocol: None,
                 application_provider: Some("openai".to_owned()),

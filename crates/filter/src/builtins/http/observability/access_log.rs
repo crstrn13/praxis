@@ -968,14 +968,27 @@ fn connect_udp(formatter: Formatter3164, address: &str) -> syslog::Result<Logger
 /// indefinitely. `Logger::info` flushes the TCP backend per message.
 #[cfg(feature = "access-log-syslog")]
 fn connect_tcp(formatter: Formatter3164, address: &str) -> syslog::Result<Logger<LoggerBackend, Formatter3164>> {
-    let addr = address
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "syslog tcp address did not resolve"))?;
-    let stream = std::net::TcpStream::connect_timeout(&addr, SYSLOG_TCP_TIMEOUT)?;
+    let stream = dial_tcp(address)?;
     stream.set_write_timeout(Some(SYSLOG_TCP_TIMEOUT))?;
     Ok(Logger::new(LoggerBackend::Tcp(BufWriter::new(stream)), formatter))
+}
+
+/// Dial the first reachable address `address` resolves to, within the connect
+/// timeout. `connect_timeout` takes a single `SocketAddr`, so (unlike
+/// `TcpStream::connect`) we iterate the resolved set ourselves: a hostname that
+/// resolves to an unreachable address first (e.g. an IPv6 record when the
+/// collector listens only on IPv4) still falls through to a working one, and the
+/// last connect error surfaces if none succeed.
+#[cfg(feature = "access-log-syslog")]
+fn dial_tcp(address: &str) -> std::io::Result<std::net::TcpStream> {
+    let mut last_err = std::io::Error::new(std::io::ErrorKind::NotFound, "syslog tcp address did not resolve");
+    for addr in address.to_socket_addrs()? {
+        match std::net::TcpStream::connect_timeout(&addr, SYSLOG_TCP_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Cached response metadata for emit on the body phase.

@@ -26,6 +26,8 @@ use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use http::header::HeaderName;
 use serde::Deserialize;
+#[cfg(feature = "access-log-syslog")]
+use syslog::{Facility, Formatter3164, Logger, LoggerBackend};
 use tracing::info;
 
 use crate::{
@@ -153,8 +155,9 @@ struct AccessLogConfig {
     /// decides text or JSON output. Mutually exclusive with `fields`.
     template: Option<String>,
 
-    /// Output sink: `{type: stdout}` or `{type: file, path: ...}`. Omitted means
-    /// emit through the tracing subscriber.
+    /// Output sink: `{type: stdout}`, `{type: file, path: ...}`, or (with the
+    /// `access-log-syslog` feature) `{type: syslog, ...}`. Omitted means emit
+    /// through the tracing subscriber.
     #[serde(default)]
     sink: Option<SinkConfig>,
 }
@@ -174,6 +177,19 @@ enum SinkConfig {
         /// Destination path, opened in append+create mode.
         path: String,
     },
+    /// Send each line as a syslog message (RFC 3164) over a local socket, UDP,
+    /// or TCP.
+    #[cfg(feature = "access-log-syslog")]
+    Syslog {
+        /// Syslog facility encoded in the message PRI header.
+        facility: SyslogFacility,
+        /// Transport carrier (unix socket, UDP, or TCP).
+        transport: SyslogTransport,
+        /// Remote `host:port` for `udp`/`tcp`; `None` for `unix`.
+        address: Option<String>,
+        /// Local socket path override for `unix` (`None` means `/dev/log`).
+        path: Option<String>,
+    },
 }
 
 /// Sink config exactly as written in YAML, before validation into
@@ -182,13 +198,30 @@ enum SinkConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSinkConfig {
-    /// Sink kind (`stdout` or `file`).
+    /// Sink kind (`stdout`, `file`, or `syslog` with the `access-log-syslog`
+    /// feature).
     #[serde(rename = "type")]
     kind: SinkKind,
 
-    /// File path; required for `file`, rejected for `stdout`.
+    /// File path; required for `file`, rejected for `stdout`. Doubles as the
+    /// local socket path override for `syslog` + `transport: unix`.
     #[serde(default)]
     path: Option<String>,
+
+    /// Syslog transport. Only meaningful for `type: syslog`; defaults to `unix`.
+    #[cfg(feature = "access-log-syslog")]
+    #[serde(default)]
+    transport: SyslogTransport,
+
+    /// Remote `host:port` for `syslog` with `transport: udp`/`tcp`.
+    #[cfg(feature = "access-log-syslog")]
+    #[serde(default)]
+    address: Option<String>,
+
+    /// Syslog facility. Only meaningful for `type: syslog`; defaults to `user`.
+    #[cfg(feature = "access-log-syslog")]
+    #[serde(default)]
+    facility: SyslogFacility,
 }
 
 /// Direct output sink kind discriminant.
@@ -199,19 +232,136 @@ enum SinkKind {
     Stdout,
     /// Append NDJSON lines to a file.
     File,
+    /// Send lines as syslog messages.
+    #[cfg(feature = "access-log-syslog")]
+    Syslog,
 }
 
 impl TryFrom<RawSinkConfig> for SinkConfig {
     type Error = String;
 
     fn try_from(raw: RawSinkConfig) -> Result<Self, Self::Error> {
-        match (raw.kind, raw.path) {
-            (SinkKind::Stdout, None) => Ok(Self::Stdout),
-            (SinkKind::Stdout, Some(_)) => Err("access_log: sink type stdout does not accept a path".to_owned()),
-            (SinkKind::File, Some(path)) => Ok(Self::File { path }),
-            (SinkKind::File, None) => Err("access_log: sink type file requires a path".to_owned()),
+        match raw.kind {
+            SinkKind::Stdout => match raw.path {
+                None => Ok(Self::Stdout),
+                Some(_) => Err("access_log: sink type stdout does not accept a path".to_owned()),
+            },
+            SinkKind::File => match raw.path {
+                Some(path) => Ok(Self::File { path }),
+                None => Err("access_log: sink type file requires a path".to_owned()),
+            },
+            #[cfg(feature = "access-log-syslog")]
+            SinkKind::Syslog => Self::try_syslog(raw),
         }
     }
+}
+
+#[cfg(feature = "access-log-syslog")]
+impl SinkConfig {
+    /// Validate a `syslog` sink config: `udp`/`tcp` require an `address`; `unix`
+    /// takes an optional socket `path`.
+    fn try_syslog(raw: RawSinkConfig) -> Result<Self, String> {
+        if matches!(raw.transport, SyslogTransport::Udp | SyslogTransport::Tcp) && raw.address.is_none() {
+            return Err("access_log: sink transport udp/tcp requires an address".to_owned());
+        }
+        Ok(Self::Syslog {
+            facility: raw.facility,
+            transport: raw.transport,
+            address: raw.address,
+            path: raw.path,
+        })
+    }
+}
+
+/// Standard syslog facility codes (RFC 3164 §4.1.1).
+#[cfg(feature = "access-log-syslog")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SyslogFacility {
+    /// Kernel messages.
+    Kern,
+    /// User-level messages (default).
+    #[default]
+    User,
+    /// Mail system.
+    Mail,
+    /// System daemons.
+    Daemon,
+    /// Security/authorization messages.
+    Auth,
+    /// Messages generated internally by syslogd.
+    Syslog,
+    /// Line printer subsystem.
+    Lpr,
+    /// Network news subsystem.
+    News,
+    /// UUCP subsystem.
+    Uucp,
+    /// Clock daemon.
+    Cron,
+    /// Security/authorization messages (private).
+    Authpriv,
+    /// FTP daemon.
+    Ftp,
+    /// Local use 0.
+    Local0,
+    /// Local use 1.
+    Local1,
+    /// Local use 2.
+    Local2,
+    /// Local use 3.
+    Local3,
+    /// Local use 4.
+    Local4,
+    /// Local use 5.
+    Local5,
+    /// Local use 6.
+    Local6,
+    /// Local use 7.
+    Local7,
+}
+
+#[cfg(feature = "access-log-syslog")]
+impl SyslogFacility {
+    /// Map to the `syslog` crate's [`Facility`], which sets the PRI header.
+    fn syslog_facility(self) -> Facility {
+        match self {
+            SyslogFacility::Kern => Facility::LOG_KERN,
+            SyslogFacility::User => Facility::LOG_USER,
+            SyslogFacility::Mail => Facility::LOG_MAIL,
+            SyslogFacility::Daemon => Facility::LOG_DAEMON,
+            SyslogFacility::Auth => Facility::LOG_AUTH,
+            SyslogFacility::Syslog => Facility::LOG_SYSLOG,
+            SyslogFacility::Lpr => Facility::LOG_LPR,
+            SyslogFacility::News => Facility::LOG_NEWS,
+            SyslogFacility::Uucp => Facility::LOG_UUCP,
+            SyslogFacility::Cron => Facility::LOG_CRON,
+            SyslogFacility::Authpriv => Facility::LOG_AUTHPRIV,
+            SyslogFacility::Ftp => Facility::LOG_FTP,
+            SyslogFacility::Local0 => Facility::LOG_LOCAL0,
+            SyslogFacility::Local1 => Facility::LOG_LOCAL1,
+            SyslogFacility::Local2 => Facility::LOG_LOCAL2,
+            SyslogFacility::Local3 => Facility::LOG_LOCAL3,
+            SyslogFacility::Local4 => Facility::LOG_LOCAL4,
+            SyslogFacility::Local5 => Facility::LOG_LOCAL5,
+            SyslogFacility::Local6 => Facility::LOG_LOCAL6,
+            SyslogFacility::Local7 => Facility::LOG_LOCAL7,
+        }
+    }
+}
+
+/// Syslog transport carrier.
+#[cfg(feature = "access-log-syslog")]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SyslogTransport {
+    /// Local `AF_UNIX` socket (default `/dev/log`).
+    #[default]
+    Unix,
+    /// Remote UDP datagram (RFC 5426).
+    Udp,
+    /// Remote TCP stream (RFC 6587).
+    Tcp,
 }
 
 /// Emit-time access log conditions.
@@ -427,6 +577,17 @@ impl WriteWarnThrottle {
             tracing::warn!(sink = %dest, error = %err, "access_log sink write failed");
         }
     }
+
+    /// Warn about a sink failure carrying a non-`io::Error` cause (e.g. a syslog
+    /// connect error), throttled identically to [`WriteWarnThrottle::warn`].
+    #[cfg(feature = "access-log-syslog")]
+    fn warn_display(&mut self, dest: &str, err: &dyn std::fmt::Display) {
+        let now = unix_secs();
+        if now != self.last_secs {
+            self.last_secs = now;
+            tracing::warn!(sink = %dest, error = %err, "access_log sink write failed");
+        }
+    }
 }
 
 /// Seconds since the Unix epoch, saturating to 0 before 1970.
@@ -593,6 +754,138 @@ fn file_sink(path: &str) -> Result<Arc<DirectSink>, FilterError> {
     guard.insert(key, Arc::downgrade(&sink));
     drop(guard);
     Ok(sink)
+}
+
+// -----------------------------------------------------------------------------
+// Syslog sink
+// -----------------------------------------------------------------------------
+
+/// Everything the syslog writer thread needs to (re)build its `Logger`.
+///
+/// The `syslog` crate's `Logger` has no reconnect method, so the writer rebuilds
+/// it from this target after a write error. `Formatter3164` is `Clone`.
+#[cfg(feature = "access-log-syslog")]
+struct SyslogTarget {
+    /// Transport carrier for the connection.
+    transport: SyslogTransport,
+    /// Remote `host:port` for udp/tcp; `None` for unix.
+    address: Option<String>,
+    /// Local socket path for unix; `None` means `/dev/log`.
+    path: Option<String>,
+    /// Message formatter carrying the facility and process identity.
+    formatter: Formatter3164,
+    /// Destination label for diagnostics.
+    dest: Arc<str>,
+}
+
+/// Build a syslog [`DirectSink`]: assemble the formatter, then spawn the writer
+/// thread and keep its bounded-queue sender. Validation (udp/tcp need an
+/// address) happens earlier in [`SinkConfig::try_syslog`].
+#[cfg(feature = "access-log-syslog")]
+fn syslog_sink(
+    facility: SyslogFacility,
+    transport: SyslogTransport,
+    address: Option<String>,
+    path: Option<String>,
+) -> Result<Arc<DirectSink>, FilterError> {
+    let dest: Arc<str> = Arc::from(syslog_dest(transport, address.as_deref(), path.as_deref()));
+    let formatter = Formatter3164 {
+        facility: facility.syslog_facility(),
+        hostname: None,
+        process: "praxis".to_owned(),
+        pid: std::process::id(),
+    };
+    let target = SyslogTarget {
+        transport,
+        address,
+        path,
+        formatter,
+        dest: Arc::clone(&dest),
+    };
+    let (tx, rx) = sync_channel(SINK_QUEUE_CAPACITY);
+    spawn_syslog_writer(rx, target).map_err(|e| format!("access_log: cannot start syslog sink writer: {e}"))?;
+    Ok(Arc::new(DirectSink::new(tx, dest)))
+}
+
+/// Human-readable destination label for diagnostics.
+#[cfg(feature = "access-log-syslog")]
+fn syslog_dest(transport: SyslogTransport, address: Option<&str>, path: Option<&str>) -> String {
+    match transport {
+        SyslogTransport::Unix => format!("syslog:unix:{}", path.unwrap_or("/dev/log")),
+        SyslogTransport::Udp => format!("syslog:udp:{}", address.unwrap_or_default()),
+        SyslogTransport::Tcp => format!("syslog:tcp:{}", address.unwrap_or_default()),
+    }
+}
+
+/// Spawn the syslog writer thread and register its handle for shutdown.
+#[cfg(feature = "access-log-syslog")]
+fn spawn_syslog_writer(rx: Receiver<String>, target: SyslogTarget) -> std::io::Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("access-log-syslog".to_owned())
+        .spawn(move || run_syslog_writer(&rx, &target, &SINK_SHUTDOWN))?;
+    register_sink_writer(handle);
+    Ok(())
+}
+
+/// Drain the queue into the syslog `Logger`, owning its connection lifecycle and
+/// honouring [`SINK_SHUTDOWN`] so an idle writer still exits at shutdown.
+#[cfg(feature = "access-log-syslog")]
+fn run_syslog_writer(rx: &Receiver<String>, target: &SyslogTarget, shutdown: &AtomicBool) {
+    let mut logger = None;
+    let mut throttle = WriteWarnThrottle::default();
+    loop {
+        match rx.recv_timeout(SINK_POLL_INTERVAL) {
+            Ok(line) => emit_syslog(&mut logger, target, &mut throttle, &line),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if shutdown.load(Ordering::Acquire) => break,
+            Err(RecvTimeoutError::Timeout) => {},
+        }
+    }
+    while let Ok(line) = rx.try_recv() {
+        emit_syslog(&mut logger, target, &mut throttle, &line);
+    }
+}
+
+/// Send one line, lazily (re)connecting the `Logger` and dropping it on error so
+/// the next line forces a reconnect.
+#[cfg(feature = "access-log-syslog")]
+fn emit_syslog(
+    logger: &mut Option<Logger<LoggerBackend, Formatter3164>>,
+    target: &SyslogTarget,
+    throttle: &mut WriteWarnThrottle,
+    line: &str,
+) {
+    if logger.is_none() {
+        match connect_logger(target) {
+            Ok(active) => *logger = Some(active),
+            Err(e) => {
+                throttle.warn_display(&target.dest, &e);
+                return;
+            },
+        }
+    }
+    if let Some(active) = logger.as_mut()
+        && active.info(line).is_err()
+    {
+        *logger = None;
+    }
+}
+
+/// (Re)connect the `syslog` crate `Logger` for the target's transport.
+///
+/// Build-time validation guarantees an address for udp/tcp; the empty fallback
+/// would merely fail to connect and be retried, never panic.
+#[cfg(feature = "access-log-syslog")]
+fn connect_logger(target: &SyslogTarget) -> syslog::Result<Logger<LoggerBackend, Formatter3164>> {
+    let formatter = target.formatter.clone();
+    match target.transport {
+        SyslogTransport::Unix => match target.path.as_deref() {
+            Some(path) => syslog::unix_custom(formatter, path),
+            None => syslog::unix(formatter),
+        },
+        SyslogTransport::Udp => syslog::udp(formatter, "0.0.0.0:0", target.address.as_deref().unwrap_or_default()),
+        SyslogTransport::Tcp => syslog::tcp(formatter, target.address.as_deref().unwrap_or_default()),
+    }
 }
 
 /// Cached response metadata for emit on the body phase.
@@ -1541,6 +1834,13 @@ fn build_runtime_sink(sink_cfg: Option<SinkConfig>) -> Result<RuntimeSink, Filte
         None => Ok(RuntimeSink::Tracing),
         Some(SinkConfig::Stdout) => Ok(RuntimeSink::Direct(stdout_sink()?)),
         Some(SinkConfig::File { path }) => Ok(RuntimeSink::Direct(file_sink(&path)?)),
+        #[cfg(feature = "access-log-syslog")]
+        Some(SinkConfig::Syslog {
+            facility,
+            transport,
+            address,
+            path,
+        }) => Ok(RuntimeSink::Direct(syslog_sink(facility, transport, address, path)?)),
     }
 }
 
@@ -2865,6 +3165,56 @@ response_headers: [content-type]
             .err()
             .expect("file sink without a path should fail");
         assert!(err.to_string().contains("requires a path"), "got: {err}");
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn from_config_rejects_syslog_udp_without_address() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: syslog\n  transport: udp").unwrap();
+        let err = AccessLogFilter::from_config(&yaml)
+            .err()
+            .expect("syslog udp without an address should fail");
+        assert!(err.to_string().contains("requires an address"), "got: {err}");
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn from_config_rejects_syslog_tcp_without_address() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("sink:\n  type: syslog\n  transport: tcp").unwrap();
+        let err = AccessLogFilter::from_config(&yaml)
+            .err()
+            .expect("syslog tcp without an address should fail");
+        assert!(err.to_string().contains("requires an address"), "got: {err}");
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn syslog_unix_sink_delivers_rendered_line() {
+        // Bind a datagram receiver first so the writer thread's lazy connect
+        // succeeds, then drive the emit path and confirm the framed line lands.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("syslog.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "template: '{{method}} {{path}} {{status}}'\nsink:\n  type: syslog\n  transport: unix\n  path: {}\n  facility: local0",
+            sock_path.to_str().unwrap()
+        ))
+        .unwrap();
+        let filter = test_filter(&yaml);
+
+        let req = crate::test_utils::make_request(http::Method::GET, "/health");
+        let ctx = crate::test_utils::make_filter_context(&req);
+        filter.emit_access_log(&ctx, 200, None, 7);
+
+        let mut buf = [0_u8; 2048];
+        let n = receiver.recv(&mut buf).unwrap();
+        let msg = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            msg.contains("GET /health 200"),
+            "syslog receiver should get the rendered line, got: {msg}"
+        );
     }
 
     #[test]

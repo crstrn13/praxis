@@ -17,9 +17,6 @@ fn access_log_syslog_sink() {
     let backend_port = backend_port_guard.port();
     let proxy_port = free_port();
 
-    // Bind a UDP syslog collector on an ephemeral port, then point the example's
-    // sink at it. The example ships a fixed `127.0.0.1:5514` for operators; the
-    // test overrides it so the run is isolated and self-contained.
     let collector = UdpSocket::bind("127.0.0.1:0").expect("bind udp collector");
     collector
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -54,11 +51,6 @@ fn access_log_syslog_sink() {
     );
     assert_eq!(parse_status(&raw), 200, "syslog sink should not disrupt proxying");
 
-    // The sink emits one RFC 3164 datagram per request. Prove the feature
-    // end-to-end by reading datagrams back and confirming one carries the
-    // rendered template line for this request with real per-request values.
-    // Earlier datagrams can come from the harness readiness probe, so scan
-    // until the `/health` line arrives or the socket read times out.
     let mut buf = [0_u8; 2048];
     let mut seen = Vec::new();
     let delivered = loop {

@@ -21,9 +21,9 @@ Logs structured access records for each request and response.
 | `sink` | SinkConfig | no | Output sink: `{type: stdout}`, `{type: file, path: ...}`, or (with the `access-log-syslog` feature) `{type: syslog, ...}`. Omitted means emit through the tracing subscriber. |
 | `sink.type` | `stdout` \| `file` \| `syslog` | yes | Sink kind (`stdout`, `file`, or `syslog` with the `access-log-syslog` feature). |
 | `sink.path` | string | no | File path; required for `file`, rejected for `stdout`. Doubles as the local socket path override for `syslog` + `transport: unix`. |
-| `sink.transport` | `unix` \| `udp` \| `tcp` | no | Syslog transport. Only meaningful for `type: syslog`; defaults to `unix`. |
+| `sink.transport` | `unix` \| `udp` \| `tcp` | no | Syslog transport. Only valid for `type: syslog`; defaults to `unix`. |
 | `sink.address` | string | no | Remote `host:port` for `syslog` with `transport: udp`/`tcp`. |
-| `sink.facility` | `kern` \| `user` \| `mail` \| `daemon` \| `auth` \| `syslog` \| `lpr` \| `news` \| `uucp` \| `cron` \| `authpriv` \| `ftp` \| `local0` \| `local1` \| `local2` \| `local3` \| `local4` \| `local5` \| `local6` \| `local7` | no | Syslog facility. Only meaningful for `type: syslog`; defaults to `user`. |
+| `sink.facility` | `kern` \| `user` \| `mail` \| `daemon` \| `auth` \| `syslog` \| `lpr` \| `news` \| `uucp` \| `cron` \| `authpriv` \| `ftp` \| `local0` \| `local1` \| `local2` \| `local3` \| `local4` \| `local5` \| `local6` \| `local7` | no | Syslog facility. Only valid for `type: syslog`; defaults to `user`. |
 
 ## Examples
 

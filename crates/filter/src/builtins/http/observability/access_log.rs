@@ -340,12 +340,14 @@ fn remote_address(has_path: bool, address: Option<String>) -> Result<String, Str
 fn validate_host_port(address: &str) -> Result<(), String> {
     let invalid = || format!("access_log: syslog address {address:?} is not host:port");
     let (host, port) = address.rsplit_once(':').ok_or_else(invalid)?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
+    // A bracketed IPv6 host may contain colons (`[::1]`); an unbracketed host may
+    // not, so `collector:514:123` is rejected rather than read as host `collector:514`.
+    let host_ok = match host.strip_prefix('[').and_then(|inner| inner.strip_suffix(']')) {
+        Some(inner) => !inner.is_empty(),
+        None => !host.is_empty() && !host.contains(':'),
+    };
     match port.parse::<u16>() {
-        Ok(port) if port != 0 && !host.is_empty() => Ok(()),
+        Ok(port) if port != 0 && host_ok => Ok(()),
         _ => Err(invalid()),
     }
 }
@@ -867,6 +869,25 @@ fn rfc3164_timestamp<Tz: chrono::TimeZone<Offset: std::fmt::Display>>(now: &Date
     now.format("%b %e %H:%M:%S").to_string()
 }
 
+/// RFC 3164 §4.1 caps a complete syslog message (header included) at 1024 bytes;
+/// a receiver may truncate or discard anything longer.
+#[cfg(feature = "access-log-syslog")]
+const RFC3164_MAX_BYTES: usize = 1024;
+
+/// Truncate `record` in place to at most [`RFC3164_MAX_BYTES`], on a UTF-8 char
+/// boundary so the emitted message stays valid and within the RFC 3164 §4.1 limit.
+#[cfg(feature = "access-log-syslog")]
+fn cap_rfc3164(record: &mut String) {
+    if record.len() <= RFC3164_MAX_BYTES {
+        return;
+    }
+    let mut end = RFC3164_MAX_BYTES;
+    while end > 0 && !record.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    record.truncate(end);
+}
+
 #[cfg(feature = "access-log-syslog")]
 impl<T: std::fmt::Display> LogFormat<T> for Rfc3164Formatter {
     fn format<W: std::io::Write>(&self, w: &mut W, _severity: Severity, message: T) -> syslog::Result<()> {
@@ -877,7 +898,8 @@ impl<T: std::fmt::Display> LogFormat<T> for Rfc3164Formatter {
             .hostname
             .as_deref()
             .map_or_else(String::new, |name| format!("{name} "));
-        let record = format!("<{pri}>{timestamp} {host}{}[{}]: {message}", self.process, self.pid);
+        let mut record = format!("<{pri}>{timestamp} {host}{}[{}]: {message}", self.process, self.pid);
+        cap_rfc3164(&mut record);
         if self.octet_framed {
             write!(w, "{} {record}", record.len())?;
         } else {
@@ -1000,30 +1022,68 @@ fn connect_logger(target: &SyslogTarget) -> syslog::Result<Logger<LoggerBackend,
     let formatter = target.formatter.clone();
     match &target.destination {
         SyslogDestination::Unix { path } => connect_unix(formatter, path.as_deref(), SYSLOG_IO_TIMEOUT),
-        SyslogDestination::Udp { address } => connect_udp(formatter, address),
+        SyslogDestination::Udp { address } => connect_udp(formatter, address, SYSLOG_IO_TIMEOUT),
         SyslogDestination::Tcp { address } => connect_tcp(formatter, address, SYSLOG_IO_TIMEOUT),
     }
 }
 
-/// Connect a Unix syslog logger with a bounded write timeout (the crate's helpers
-/// set none), trying a datagram socket first (the usual `/dev/log` shape) and
+/// Run a blocking I/O op on a short-lived thread, returning its result or a
+/// `TimedOut` error if it does not finish within `timeout`. Bounds operations std
+/// offers no timeout for (unix stream connect, DNS resolution) so a stalled peer or
+/// resolver cannot block the writer thread (and thus its bounded queue) forever.
+#[cfg(feature = "access-log-syslog")]
+fn with_timeout<T, F>(timeout: Duration, op: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    let (tx, rx) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("syslog-io".to_owned())
+        .spawn(move || {
+            drop(tx.send(op()));
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "syslog io timed out")),
+    }
+}
+
+/// Resolve `address` to socket addresses within `timeout`, so a stalled resolver
+/// cannot block the writer thread before the connect timeout even begins.
+#[cfg(feature = "access-log-syslog")]
+fn resolve_addrs(address: &str, timeout: Duration) -> std::io::Result<Vec<SocketAddr>> {
+    let owned = address.to_owned();
+    with_timeout(timeout, move || Ok(owned.to_socket_addrs()?.collect()))
+}
+
+/// Connect a Unix syslog logger with bounded connect and write timeouts (the crate's
+/// helpers set none), trying a datagram socket first (the usual `/dev/log` shape) and
 /// falling through to a `SOCK_STREAM` collector.
 #[cfg(feature = "access-log-syslog")]
 fn connect_unix(
     formatter: Rfc3164Formatter,
     path: Option<&str>,
-    write_timeout: Duration,
+    timeout: Duration,
 ) -> syslog::Result<Logger<LoggerBackend, Rfc3164Formatter>> {
     let path = path.unwrap_or("/dev/log");
-    if let Ok(socket) = unix_datagram(path, write_timeout) {
+    if let Ok(socket) = unix_datagram(path, timeout) {
         return Ok(Logger::new(LoggerBackend::Unix(socket), formatter));
     }
-    let stream = UnixStream::connect(path)?;
-    stream.set_write_timeout(Some(write_timeout))?;
+    let stream = connect_unix_stream(path, timeout)?;
+    stream.set_write_timeout(Some(timeout))?;
     Ok(Logger::new(
         LoggerBackend::UnixStream(BufWriter::new(stream)),
         formatter,
     ))
+}
+
+/// Connect a Unix stream within `timeout` so a full listen backlog cannot block the
+/// writer; std has no bounded `UnixStream::connect`, so it runs via [`with_timeout`].
+#[cfg(feature = "access-log-syslog")]
+fn connect_unix_stream(path: &str, timeout: Duration) -> std::io::Result<UnixStream> {
+    let owned = path.to_owned();
+    with_timeout(timeout, move || UnixStream::connect(owned))
 }
 
 /// Bind an unbound `AF_UNIX` datagram socket with a write timeout and connect it
@@ -1036,15 +1096,25 @@ fn unix_datagram(path: &str, write_timeout: Duration) -> std::io::Result<UnixDat
     Ok(socket)
 }
 
-/// Connect a UDP syslog logger, binding the local socket in the target's address
-/// family so an IPv6 collector (e.g. `[::1]:514`) is reachable.
+/// Connect a UDP syslog logger, resolving the collector within `timeout` and binding
+/// the local socket in its address family so an IPv6 target (e.g. `[::1]:514`) works.
 #[cfg(feature = "access-log-syslog")]
-fn connect_udp(formatter: Rfc3164Formatter, address: &str) -> syslog::Result<Logger<LoggerBackend, Rfc3164Formatter>> {
-    let local = match address.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
-        Some(SocketAddr::V6(_)) => "[::]:0",
-        _ => "0.0.0.0:0",
+fn connect_udp(
+    formatter: Rfc3164Formatter,
+    address: &str,
+    timeout: Duration,
+) -> syslog::Result<Logger<LoggerBackend, Rfc3164Formatter>> {
+    let server = resolve_addrs(address, timeout)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "syslog udp address did not resolve"))?;
+    // Resolved SocketAddr for both local and server keeps the crate's bind DNS-free.
+    let local: SocketAddr = if server.is_ipv6() {
+        ([0_u8; 16], 0).into()
+    } else {
+        ([0_u8; 4], 0).into()
     };
-    syslog::udp(formatter, local, address)
+    syslog::udp(formatter, local, server)
 }
 
 /// Connect a TCP syslog logger with bounded connect and write timeouts so a stalled
@@ -1060,13 +1130,13 @@ fn connect_tcp(
     Ok(Logger::new(LoggerBackend::Tcp(BufWriter::new(stream)), formatter))
 }
 
-/// Dial the first reachable address `address` resolves to, within the connect
-/// timeout. `connect_timeout` takes one `SocketAddr`, so we iterate the resolved set
-/// ourselves (skipping unreachable records) and surface the last error if none work.
+/// Dial the first reachable address `address` resolves to, bounding both resolution
+/// and each connect by `timeout`. `connect_timeout` takes one `SocketAddr`, so we
+/// iterate the resolved set ourselves and surface the last error if none work.
 #[cfg(feature = "access-log-syslog")]
 fn dial_tcp(address: &str, timeout: Duration) -> std::io::Result<std::net::TcpStream> {
     let mut last_err = std::io::Error::new(std::io::ErrorKind::NotFound, "syslog tcp address did not resolve");
-    for addr in address.to_socket_addrs()? {
+    for addr in resolve_addrs(address, timeout)? {
         match std::net::TcpStream::connect_timeout(&addr, timeout) {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = e,
@@ -3542,6 +3612,7 @@ response_headers: [content-type]
             "collector:70000",
             "collector:abc",
             ":514",
+            "collector:514:123",
         ] {
             assert!(
                 remote_address(false, Some(bad.to_owned())).is_err(),
@@ -3609,6 +3680,39 @@ response_headers: [content-type]
             timed_out,
             "a stalled unix collector must not block the writer indefinitely"
         );
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn rfc3164_message_is_capped_at_1024_bytes() {
+        // RFC 3164 §4.1 limits a complete message to 1024 bytes; an overlong rendered
+        // line must be truncated on the wire rather than sent in full.
+        let formatter = test_formatter();
+        let mut out = Vec::new();
+        <Rfc3164Formatter as LogFormat<String>>::format(&formatter, &mut out, Severity::LOG_INFO, "a".repeat(4096))
+            .unwrap();
+        assert!(
+            out.len() <= RFC3164_MAX_BYTES,
+            "RFC 3164 §4.1 caps the message at {RFC3164_MAX_BYTES} bytes, got {}",
+            out.len()
+        );
+        assert!(std::str::from_utf8(&out).is_ok(), "truncation must keep valid UTF-8");
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test stalls an op with thread::sleep")]
+    fn with_timeout_bounds_a_stalled_operation() {
+        // A completed op returns its value; an op that outlasts the timeout surfaces a
+        // TimedOut error instead of blocking, which is how unix connect and DNS stay
+        // bounded on the writer thread.
+        let quick: std::io::Result<u8> = with_timeout(Duration::from_secs(5), || Ok(7));
+        assert_eq!(quick.unwrap(), 7);
+        let slow: std::io::Result<u8> = with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(0)
+        });
+        assert_eq!(slow.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]

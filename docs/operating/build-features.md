@@ -136,7 +136,9 @@ production` at startup. Do not run an experimental build in production.
   it.
 - **`access-log-syslog`**: the `access_log` filter's `sink: {type: syslog}`
   output, sending each record as an RFC 3164 message over a Unix socket, UDP, or
-  TCP. Off by default; adds the optional `syslog` crate, which is crypto-free and
+  TCP. Each message is capped at 1024 bytes (RFC 3164 §4.1), so an overlength
+  record is truncated and a structured (e.g. JSON) payload may not remain valid.
+  Off by default; adds the optional `syslog` crate, which is crypto-free and
   kept out of the default and FIPS builds.
 
 ## Notes

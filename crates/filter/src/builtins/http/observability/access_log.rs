@@ -975,44 +975,74 @@ fn spawn_syslog_writer(rx: Receiver<String>, target: SyslogTarget) -> std::io::R
 /// honouring [`SINK_SHUTDOWN`] so an idle writer still exits at shutdown.
 #[cfg(feature = "access-log-syslog")]
 fn run_syslog_writer(rx: &Receiver<String>, target: &SyslogTarget, shutdown: &AtomicBool) {
-    let mut logger = None;
-    let mut throttle = WriteWarnThrottle::default();
+    let mut state = SyslogWriterState::default();
     loop {
         match rx.recv_timeout(SINK_POLL_INTERVAL) {
-            Ok(line) => emit_syslog(&mut logger, target, &mut throttle, &line),
+            Ok(line) => state.emit(target, &line),
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if shutdown.load(Ordering::Acquire) => break,
             Err(RecvTimeoutError::Timeout) => {},
         }
     }
     while let Ok(line) = rx.try_recv() {
-        emit_syslog(&mut logger, target, &mut throttle, &line);
+        state.emit(target, &line);
     }
 }
 
-/// Send one line, lazily (re)connecting the `Logger` and dropping it on error so
-/// the next line forces a reconnect.
+/// After a failed (re)connection the writer suppresses reconnects for this long,
+/// dropping records meanwhile. Every connect attempt may spawn a `syslog-io` helper
+/// thread (for a Unix connect or DNS resolution) that a hung syscall can leave
+/// blocked, so bounding the reconnect rate bounds how fast those helpers can pile up
+/// during a sustained outage.
 #[cfg(feature = "access-log-syslog")]
-fn emit_syslog(
-    logger: &mut Option<Logger<LoggerBackend, Rfc3164Formatter>>,
-    target: &SyslogTarget,
-    throttle: &mut WriteWarnThrottle,
-    line: &str,
-) {
-    if logger.is_none() {
-        match connect_logger(target) {
-            Ok(active) => *logger = Some(active),
-            Err(e) => {
-                throttle.warn_display(&target.dest, &e);
+const SYSLOG_RECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// State the syslog writer carries across records: the lazily-built `Logger`, the
+/// failure-warning throttle, and the post-failure reconnect-cooldown deadline.
+#[cfg(feature = "access-log-syslog")]
+#[derive(Default)]
+struct SyslogWriterState {
+    /// Active logger, or `None` before the first record and after a failure.
+    logger: Option<Logger<LoggerBackend, Rfc3164Formatter>>,
+    /// Rate-limits connect/write failure warnings.
+    throttle: WriteWarnThrottle,
+    /// When set, reconnect attempts are suppressed until this instant.
+    cooldown_until: Option<Instant>,
+}
+
+#[cfg(feature = "access-log-syslog")]
+impl SyslogWriterState {
+    /// Emit one line, lazily (re)connecting the `Logger`. A failed connect starts a
+    /// cooldown during which records are dropped, so a stalled peer or resolver
+    /// cannot make every queued record spawn another blocked helper thread.
+    fn emit(&mut self, target: &SyslogTarget, line: &str) {
+        if self.logger.is_none() {
+            if self.in_cooldown() {
                 return;
-            },
+            }
+            match connect_logger(target) {
+                Ok(active) => {
+                    self.logger = Some(active);
+                    self.cooldown_until = None;
+                },
+                Err(e) => {
+                    self.throttle.warn_display(&target.dest, &e);
+                    self.cooldown_until = Instant::now().checked_add(SYSLOG_RECONNECT_COOLDOWN);
+                    return;
+                },
+            }
+        }
+        if let Some(active) = self.logger.as_mut()
+            && let Err(e) = active.info(line)
+        {
+            self.throttle.warn_display(&target.dest, &e);
+            self.logger = None;
         }
     }
-    if let Some(active) = logger.as_mut()
-        && let Err(e) = active.info(line)
-    {
-        throttle.warn_display(&target.dest, &e);
-        *logger = None;
+
+    /// Whether the post-failure reconnect cooldown is still in effect.
+    fn in_cooldown(&self) -> bool {
+        self.cooldown_until.is_some_and(|until| Instant::now() < until)
     }
 }
 
@@ -1059,7 +1089,9 @@ fn resolve_addrs(address: &str, timeout: Duration) -> std::io::Result<Vec<Socket
 
 /// Connect a Unix syslog logger with bounded connect and write timeouts (the crate's
 /// helpers set none), trying a datagram socket first (the usual `/dev/log` shape) and
-/// falling through to a `SOCK_STREAM` collector.
+/// falling through to a `SOCK_STREAM` collector only when the datagram connect fails
+/// with the socket-type mismatch, so a missing socket or denied permission surfaces as
+/// itself rather than a masked stream-connect error.
 #[cfg(feature = "access-log-syslog")]
 fn connect_unix(
     formatter: Rfc3164Formatter,
@@ -1067,15 +1099,44 @@ fn connect_unix(
     timeout: Duration,
 ) -> syslog::Result<Logger<LoggerBackend, Rfc3164Formatter>> {
     let path = path.unwrap_or("/dev/log");
-    if let Ok(socket) = unix_datagram(path, timeout) {
-        return Ok(Logger::new(LoggerBackend::Unix(socket), formatter));
+    match unix_datagram(path, timeout) {
+        Ok(socket) => Ok(Logger::new(LoggerBackend::Unix(socket), formatter)),
+        Err(e) if is_wrong_socket_type(&e) => connect_unix_stream_logger(formatter, path, timeout),
+        Err(e) => Err(e.into()),
     }
+}
+
+/// Build a stream-backed Unix syslog logger for a `SOCK_STREAM` collector, bounding
+/// both the connect and subsequent writes by `timeout`.
+#[cfg(feature = "access-log-syslog")]
+fn connect_unix_stream_logger(
+    formatter: Rfc3164Formatter,
+    path: &str,
+    timeout: Duration,
+) -> syslog::Result<Logger<LoggerBackend, Rfc3164Formatter>> {
     let stream = connect_unix_stream(path, timeout)?;
     stream.set_write_timeout(Some(timeout))?;
     Ok(Logger::new(
         LoggerBackend::UnixStream(BufWriter::new(stream)),
         formatter,
     ))
+}
+
+/// Raw `EPROTOTYPE` errno: a datagram connect to a `SOCK_STREAM` endpoint reports it
+/// (Linux `91`). The lone datagram error that warrants the stream fallback.
+#[cfg(all(feature = "access-log-syslog", target_os = "linux"))]
+const EPROTOTYPE_ERRNO: i32 = 91;
+/// Raw `EPROTOTYPE` errno on BSD/macOS targets (`41`).
+#[cfg(all(feature = "access-log-syslog", not(target_os = "linux")))]
+const EPROTOTYPE_ERRNO: i32 = 41;
+
+/// Whether a Unix datagram connect error means the endpoint is a `SOCK_STREAM` socket
+/// (retry it as a stream) rather than a real failure such as a missing socket or
+/// denied permission. `EPROTOTYPE` has no std `ErrorKind`, so match its raw errno;
+/// `InvalidInput` covers the same mismatch surfaced as a kind.
+#[cfg(feature = "access-log-syslog")]
+fn is_wrong_socket_type(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput || err.raw_os_error() == Some(EPROTOTYPE_ERRNO)
 }
 
 /// Connect a Unix stream within `timeout` so a full listen backlog cannot block the
@@ -3713,6 +3774,42 @@ response_headers: [content-type]
             Ok(0)
         });
         assert_eq!(slow.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn syslog_writer_backs_off_after_a_failed_connect() {
+        // A failed (re)connection must start a cooldown so the writer stops retrying
+        // (and stops spawning helper threads) on every subsequent record until it
+        // expires. A missing socket path fails the connect quickly.
+        let target = SyslogTarget {
+            destination: SyslogDestination::Unix {
+                path: Some("/nonexistent/praxis-syslog-test.sock".to_owned()),
+            },
+            formatter: test_formatter(),
+            dest: Arc::from("syslog:unix:/nonexistent/praxis-syslog-test.sock"),
+        };
+        let mut state = SyslogWriterState::default();
+        assert!(!state.in_cooldown(), "no cooldown before the first attempt");
+        state.emit(&target, "first");
+        assert!(state.logger.is_none(), "a missing socket must not yield a logger");
+        assert!(
+            state.in_cooldown(),
+            "a failed connect must start the reconnect cooldown"
+        );
+    }
+
+    #[cfg(feature = "access-log-syslog")]
+    #[test]
+    fn stream_fallback_only_on_socket_type_mismatch() {
+        use std::io::{Error, ErrorKind};
+        // A missing socket or denied permission is a real datagram failure: surface it
+        // rather than masking it with a stream-connect fallback.
+        assert!(!is_wrong_socket_type(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_wrong_socket_type(&Error::from(ErrorKind::PermissionDenied)));
+        // InvalidInput and raw EPROTOTYPE both mean the endpoint is a stream socket.
+        assert!(is_wrong_socket_type(&Error::from(ErrorKind::InvalidInput)));
+        assert!(is_wrong_socket_type(&Error::from_raw_os_error(EPROTOTYPE_ERRNO)));
     }
 
     #[test]

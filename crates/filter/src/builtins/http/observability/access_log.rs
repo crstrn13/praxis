@@ -1012,9 +1012,10 @@ struct SyslogWriterState {
 
 #[cfg(feature = "access-log-syslog")]
 impl SyslogWriterState {
-    /// Emit one line, lazily (re)connecting the `Logger`. A failed connect starts a
-    /// cooldown during which records are dropped, so a stalled peer or resolver
-    /// cannot make every queued record spawn another blocked helper thread.
+    /// Emit one line, lazily (re)connecting the `Logger`. A failed connect *or* send
+    /// starts a cooldown during which records are dropped, so a stalled peer or
+    /// resolver cannot make every queued record block for the I/O timeout or spawn
+    /// another blocked helper thread.
     fn emit(&mut self, target: &SyslogTarget, line: &str) {
         if self.logger.is_none() {
             if self.in_cooldown() {
@@ -1027,7 +1028,7 @@ impl SyslogWriterState {
                 },
                 Err(e) => {
                     self.throttle.warn_display(&target.dest, &e);
-                    self.cooldown_until = Instant::now().checked_add(SYSLOG_RECONNECT_COOLDOWN);
+                    self.start_cooldown();
                     return;
                 },
             }
@@ -1036,8 +1037,17 @@ impl SyslogWriterState {
             && let Err(e) = active.info(line)
         {
             self.throttle.warn_display(&target.dest, &e);
+            // A send failure forces a reconnect on the next record; cool down too so a
+            // collector that stalls after connecting cannot loop one timed-out write
+            // (and reconnect) per record.
             self.logger = None;
+            self.start_cooldown();
         }
+    }
+
+    /// Begin the post-failure reconnect cooldown from now.
+    fn start_cooldown(&mut self) {
+        self.cooldown_until = Instant::now().checked_add(SYSLOG_RECONNECT_COOLDOWN);
     }
 
     /// Whether the post-failure reconnect cooldown is still in effect.

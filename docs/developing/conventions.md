@@ -1,5 +1,11 @@
 # Development Conventions
 
+The following is a quickstart with regard to the project's development
+conventions. For the full documentation, including project scaffolding, etc
+see [praxis-proxy/conventions].
+
+[praxis-proxy/conventions]: https://github.com/praxis-proxy/conventions
+
 ## Coding Style
 
 ### General Principles
@@ -687,3 +693,11 @@ skip the size and description checks. For a one-off
 exception, a reviewer can add `skip/pr-conventions`
 (size, description, commit format, and authorship) or
 `skip/commit-signing` (signed commits) to the PR.
+
+One rule no gate checks: a PR with a user-visible
+change also adds its entry under `[Unreleased]` in
+`CHANGELOG.md`. The [changelog
+convention][changelog-convention] covers the format.
+
+[changelog-convention]:
+https://github.com/praxis-proxy/conventions/blob/main/docs/release.md#changelog

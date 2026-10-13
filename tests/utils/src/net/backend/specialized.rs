@@ -9,7 +9,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -184,7 +184,83 @@ pub fn start_stateful_backend(responses: Vec<(u16, String)>) -> BackendGuard {
     })
 }
 
-/// Shared request log for [`start_reused_connection_kill_backend`]:
+/// Start a backend that injects raw bytes as a response header line.
+///
+/// `malformed_header` may contain CRLF, control characters, or other
+/// illegal sequences inside what looks like a single header field.
+/// Used for response-side injection / response-splitting tests.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind or accept connections.
+pub fn start_malicious_response_header_backend(malformed_header: Vec<u8>) -> BackendGuard {
+    spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _headers = read_until_headers_complete(&mut stream);
+
+        let body = b"ok";
+        let mut response = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        response.extend_from_slice(&malformed_header);
+        if !malformed_header.ends_with(b"\r\n") {
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+        response.extend_from_slice(body);
+        stream.write_all(&response).expect("write fixture response");
+    })
+}
+
+/// Start a backend that answers with `Connection: keep-alive` and then
+/// appends a second forged response on the same socket. Used to verify
+/// the proxy does not forward keep-alive poisoning to the client.
+/// Returns the shutdown guard and connection/request log.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind or accept connections.
+pub fn start_keepalive_poison_backend() -> (BackendGuard, ReusedConnectionLog) {
+    let log: ReusedConnectionLog = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::clone(&log);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let guard = spawn_tcp_server_with_shutdown(move |stream| {
+        let connection = connections.fetch_add(1, Ordering::Relaxed);
+        serve_poisoned_connection(stream, connection, &requests);
+    });
+    (guard, log)
+}
+
+/// Start a backend that returns a `Content-Encoding: gzip` body.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind or accept connections.
+pub fn start_gzip_encoded_backend(gzip_body: Vec<u8>) -> BackendGuard {
+    spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _headers = read_until_headers_complete(&mut stream);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Encoding: gzip\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                gzip_body.len()
+            )
+            .as_bytes(),
+        );
+        response.extend_from_slice(&gzip_body);
+        stream.write_all(&response).expect("write fixture response");
+    })
+}
+
+/// Shared backend request log:
 /// `(connection_number, request_number_within_connection, method, path)`.
 pub type ReusedConnectionLog = Arc<Mutex<Vec<(usize, usize, String, String)>>>;
 
@@ -204,7 +280,7 @@ pub type ReusedConnectionLog = Arc<Mutex<Vec<(usize, usize, String, String)>>>;
 pub fn start_reused_connection_kill_backend() -> (BackendGuard, ReusedConnectionLog) {
     let log: ReusedConnectionLog = Arc::new(Mutex::new(Vec::new()));
     let log_handle = Arc::clone(&log);
-    let connection_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connection_counter = Arc::new(AtomicUsize::new(0));
 
     let guard = spawn_tcp_server_with_shutdown(move |stream| {
         let connection_num = connection_counter.fetch_add(1, Ordering::Relaxed);
@@ -212,6 +288,34 @@ pub fn start_reused_connection_kill_backend() -> (BackendGuard, ReusedConnection
     });
 
     (guard, log_handle)
+}
+
+/// Keep a poisoned connection open and record every request it actually receives.
+fn serve_poisoned_connection(mut stream: TcpStream, connection: usize, log: &ReusedConnectionLog) {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let headers = read_until_headers_complete(&mut stream);
+    record_poison_request(log, connection, 1, &headers);
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nsafe\
+          HTTP/1.1 200 OK\r\nContent-Length: 6\r\nX-Poisoned: true\r\n\r\npoison",
+        )
+        .expect("write poisoned response");
+    // Retain the socket so a later request can expose unsafe pool reuse.
+    let follow_up = read_until_headers_complete(&mut stream);
+    if !follow_up.is_empty() {
+        record_poison_request(log, connection, 2, &follow_up);
+        let _sent = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nsafe");
+    }
+}
+
+/// Record the request path and connection identity before emitting fixture bytes.
+fn record_poison_request(log: &ReusedConnectionLog, connection: usize, request: usize, headers: &str) {
+    let mut line = headers.lines().next().unwrap_or("").split_whitespace();
+    let method = line.next().unwrap_or("").to_owned();
+    let path = line.next().unwrap_or("").to_owned();
+    log.lock().unwrap().push((connection, request, method, path));
 }
 
 /// Serve the first request on `stream` with keep-alive, then read and

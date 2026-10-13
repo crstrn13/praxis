@@ -1,7 +1,3 @@
-> **WARNING**: TBD - we're applying for CNCF sandbox
-> so this is not in effect yet and is subject to
-> change.
-
 # Governance
 
 Praxis is a CNCF Sandbox project governed by this
@@ -79,8 +75,6 @@ Project Leads oversee all aspects of the project
 and all repositories. They serve as the final
 decision-makers when consensus cannot be reached.
 
-The current Project Lead is [@shaneutt](https://github.com/shaneutt).
-
 ### Reviewers
 
 Reviewers have write access to one or more
@@ -121,8 +115,8 @@ To be nominated as a review:
    Demonstrates a will to **put the good of the project
    and the community above theirs or their organizations
    needs**.
-5. Nomination by an existing reviewer
-6. Approval by the Project Lead
+4. Nomination by an existing reviewer
+5. Approval by the Project Lead
 
 Nominations are made via a GitHub issue. The
 nominee should have a track record of quality
@@ -143,7 +137,7 @@ potential to return later.
 ## Decision Making
 
 Decisions are made by lazy consensus among
-reviewers. Silence is _not_ consent.
+reviewers. Silence is *not* consent.
 
 When consensus cannot be reached:
 

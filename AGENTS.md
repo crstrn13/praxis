@@ -76,7 +76,8 @@ command reference and dev tool usage.
 
 ## Architecture
 
-See `docs/architecture/overview.md` for the full design.
+The `docs/architecture/overview.md` document must be read so that the agent
+has the full design in context.
 
 **Crate dependency flow:**
 
@@ -125,6 +126,9 @@ Conventions" in `docs/developing/conventions.md`.
   examples, benchmarks, and `Cargo.toml`/`Cargo.lock` don't count. Split
   bigger changes into a stack.
 - Every PR description says what the change does and why.
+
+One rule CI doesn't check: a PR with a user-visible change also adds its entry
+under `[Unreleased]` in `CHANGELOG.md`.
 
 ## Conventions
 

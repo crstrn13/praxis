@@ -115,11 +115,16 @@ fn prefix_uri_path(uri: http::Uri, base: &str) -> Result<http::Uri, FilterError>
 
 /// Apply body pre-read mutations to the request snapshot that header
 /// filters use for classification and routing.
+///
+/// Both mutation channels are applied: the grouped queues
+/// (`request_headers_to_remove`/`_to_set`/`extra_request_headers`) first, then
+/// the ordered trusted log (`pre_read_mutations`) on top. A single pre-read can
+/// write both — e.g. `json_body_field` promotes a body field through
+/// `extra_request_headers` while another filter records a trusted mutation — so
+/// applying only one would silently drop the other before request-phase routing.
+/// The trusted log applies last, keeping it authoritative on a conflict.
 pub(super) fn apply_pre_read_header_mutations(headers: &mut HeaderMap, ctx: &HttpFilterContext<'_>) {
-    if ctx.pre_read_mutations.is_empty() {
-        apply_request_header_mutations(headers, ctx);
-        return;
-    }
+    apply_request_header_mutations(headers, ctx);
 
     for mutation in &ctx.pre_read_mutations {
         match mutation {
@@ -136,6 +141,20 @@ pub(super) fn apply_pre_read_header_mutations(headers: &mut HeaderMap, ctx: &Htt
             },
         }
     }
+}
+
+/// Fold the pre-read phase's promoted headers into `headers`, then clear every
+/// pending channel so a later phase starts from an empty mutation set.
+///
+/// Clearing all four channels (the three grouped queues and the ordered trusted
+/// log) mirrors [`apply_pre_read_header_mutations`], which now applies both, so
+/// nothing a pre-read filter wrote is left behind to leak into a later phase.
+pub(super) fn fold_pending_into(headers: &mut HeaderMap, ctx: &mut HttpFilterContext<'_>) {
+    apply_pre_read_header_mutations(headers, ctx);
+    ctx.extra_request_headers.clear();
+    ctx.request_headers_to_remove.clear();
+    ctx.request_headers_to_set.clear();
+    ctx.pre_read_mutations.clear();
 }
 
 /// Remove inbound message-framing headers after request-body filters

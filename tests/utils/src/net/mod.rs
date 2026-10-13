@@ -14,8 +14,9 @@ pub mod wait;
 pub use backend::{
     Backend, BackendGuard, GrpcBackend, GrpcBackendGuard, ReusedConnectionLog, RoutedBackend, WsBackendGuard,
     read_http_request, spawn_raw_http_backend, start_backend, start_backend_v6, start_backend_with_shutdown,
-    start_echo_backend, start_grpc_backend, start_header_echo_backend, start_hop_by_hop_response_backend,
-    start_keepalive_backend, start_reserved_header_response_backend, start_response_header_backend,
+    start_echo_backend, start_grpc_backend, start_gzip_encoded_backend, start_header_echo_backend,
+    start_hop_by_hop_response_backend, start_keepalive_backend, start_keepalive_poison_backend,
+    start_malicious_response_header_backend, start_reserved_header_response_backend, start_response_header_backend,
     start_reused_connection_kill_backend, start_slow_backend, start_stateful_backend, start_tagged_header_echo_backend,
     start_uri_echo_backend, start_websocket_echo_backend,
 };

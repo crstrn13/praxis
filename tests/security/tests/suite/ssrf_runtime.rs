@@ -19,7 +19,10 @@ use std::{
 };
 
 use praxis_core::config::Config;
-use praxis_test_utils::{free_port, http_get, start_backend, start_full_proxy, start_tcp_tagged_backend, wait_for_tcp};
+use praxis_test_utils::{
+    free_port, http_get, parse_body, parse_status, start_backend, start_full_proxy, start_tcp_tagged_backend,
+    wait_for_tcp,
+};
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -197,5 +200,41 @@ fn http_proxy_allows_hostname_upstream_with_override() {
     assert!(
         body.contains("ssrf-target"),
         "the backend response should be forwarded, got: {body}"
+    );
+}
+
+#[test]
+fn absolute_form_authority_cannot_override_configured_backend() {
+    let target = std::net::TcpListener::bind("127.0.0.1:0").expect("bind forbidden target");
+    target.set_nonblocking(true).unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let backend = praxis_test_utils::start_backend_with_shutdown("configured-backend");
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&http_hostname_upstream_yaml(proxy_port, backend.port(), true)).unwrap();
+    let _proxy = start_full_proxy(&config);
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_tcp(&proxy_addr);
+    let request = format!(
+        "GET http://{target_addr}/latest/meta-data/ HTTP/1.1\r\nHost: {target_addr}\r\nConnection: close\r\n\r\n"
+    );
+    let raw = super::test_utils::send_text(&proxy_addr, &request);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "valid absolute-form request must use configured routing"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "configured-backend",
+        "client authority must not select an upstream"
+    );
+    let error = target
+        .accept()
+        .expect_err("forbidden target must receive no connection")
+        .kind();
+    assert_eq!(
+        error,
+        std::io::ErrorKind::WouldBlock,
+        "no SSRF connection should be queued"
     );
 }

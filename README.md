@@ -1,10 +1,10 @@
 <img width="2000" height="342" alt="praxis-banner-medium" src="https://github.com/user-attachments/assets/9787b47a-7799-474f-912c-6711abafbca2" />
 
 [![Tests](https://github.com/praxis-proxy/praxis/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/praxis/actions/workflows/tests.yaml)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13756/badge)](https://www.bestpractices.dev/projects/13756)
 [![Conformance](https://github.com/praxis-proxy/praxis/actions/workflows/conformance.yaml/badge.svg)](https://github.com/praxis-proxy/praxis/actions/workflows/conformance.yaml)
 [![Coverage: ≥96%](https://img.shields.io/badge/Coverage-≥96%25-brightgreen.svg)](https://github.com/praxis-proxy/praxis/actions/workflows/coverage.yaml)
 [![MSRV: 1.92](https://img.shields.io/badge/MSRV-1.92-brightgreen.svg)](https://blog.rust-lang.org/)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13756/badge)](https://www.bestpractices.dev/projects/13756)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Praxis is a [Rust]-based framework for building **proxy servers**.

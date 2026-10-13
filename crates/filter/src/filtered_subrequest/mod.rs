@@ -71,7 +71,7 @@ use tracing::{Instrument as _, warn};
 use self::{
     context::{SubrequestRuntimeResources, build_sub_filter_context},
     sanitize::{
-        apply_pre_read_header_mutations, apply_request_header_mutations, body_exceeds_limit, ensure_destination_host,
+        apply_request_header_mutations, body_exceeds_limit, ensure_destination_host, fold_pending_into,
         response_body_overflow_limit, sanitize_subrequest_headers, sanitize_subresponse_headers, set_authority_host,
         streaming_transport_limit, strip_reserved_headers, subrequest_uri, subresponse_from_rejection,
     },
@@ -788,6 +788,7 @@ impl FilteredSubrequestExecutor {
                 pipeline.body_capabilities().request_body_mode,
                 crate::BodyMode::StreamBuffer { .. }
             );
+
             if pre_read_body {
                 let action = pipeline
                     .execute_http_request_body(&mut filter_ctx, &mut request_body, true)
@@ -798,14 +799,19 @@ impl FilteredSubrequestExecutor {
                 if self.accounting.exceeds_limit(&filter_ctx.extensions) {
                     return Ok(RawResponse::Rejected(Rejection::status(413)));
                 }
-                apply_pre_read_header_mutations(&mut routed_req.headers, &filter_ctx);
-                filter_ctx.extra_request_headers.clear();
-                filter_ctx.request_headers_to_remove.clear();
-                filter_ctx.request_headers_to_set.clear();
-                filter_ctx.pre_read_mutations.clear();
+                fold_pending_into(&mut routed_req.headers, &mut filter_ctx);
+                filter_ctx.buffered_request_body.clone_from(&request_body);
+            }
+
+            // Re-point after pre-read: the pre-read phase baked its promoted
+            // headers into `routed_req` and cleared the pending channels.
+            // Storing `&routed_req` freezes it for the context's lifetime, so it
+            // must happen after every mutable access above; the request phase
+            // then routes on those headers. When pre-read did not run,
+            // `routed_req` still equals `sub_req` and the re-point is a no-op.
+            if pre_read_body {
                 sub_headers.clone_from(&routed_req.headers);
                 filter_ctx.request = &routed_req;
-                filter_ctx.buffered_request_body.clone_from(&request_body);
             }
 
             let action = pipeline.execute_http_request(&mut filter_ctx).await?;

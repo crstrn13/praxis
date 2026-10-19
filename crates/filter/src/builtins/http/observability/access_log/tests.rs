@@ -3,7 +3,35 @@
 
 //! Behaviour tests for the access log filter.
 
-use super::*;
+#[cfg(feature = "access-log-syslog")]
+use std::os::unix::net::UnixDatagram;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel},
+    time::Duration,
+};
+
+// Leading `::` selects the external `syslog` crate, not this module's `syslog`
+// submodule (which `use super::*` also brings into scope).
+#[cfg(feature = "access-log-syslog")]
+use ::syslog::{LogFormat, Severity};
+
+#[cfg(feature = "access-log-syslog")]
+use super::config::{SyslogDestination, SyslogFacility, remote_address};
+#[cfg(feature = "otel")]
+use super::emit::extract_otel_ids;
+#[cfg(feature = "access-log-syslog")]
+use super::syslog::{
+    EPROTOTYPE_ERRNO, RFC3164_MAX_BYTES, Rfc3164Formatter, SyslogTarget, SyslogWriterState, connect_unix,
+    is_wrong_socket_type, rfc3164_timestamp, with_timeout,
+};
+use super::{
+    config::StatusClass,
+    format::{build_record_from_fields, parse_scalar_field_token, render_text_template, sanitize_for_log},
+    sink::run_sink_writer,
+    *,
+};
 
 fn test_filter(config: &serde_yaml::Value) -> AccessLogFilter {
     let cfg: AccessLogConfig = parse_filter_config("access_log", config).unwrap();

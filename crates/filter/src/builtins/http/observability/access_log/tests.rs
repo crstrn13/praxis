@@ -3,7 +3,9 @@
 
 //! Behaviour tests for the access log filter.
 
-use super::*;
+#[cfg(feature = "access-log-syslog")]
+use super::config::remote_address;
+use super::{config::StatusClass, *};
 
 fn test_filter(config: &serde_yaml::Value) -> AccessLogFilter {
     let cfg: AccessLogConfig = parse_filter_config("access_log", config).unwrap();
